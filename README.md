@@ -1,5 +1,15 @@
 # Skill Scanner
 
+
+> [!IMPORTANT]
+> 🚧 **Fork Notice**
+>
+> This repository is a **fork of [skill-scanner](https://github.com/cisco-ai-defense/skill-scanner)** and includes:
+> - Downgraded `httpx` and `litellm` to compatible versions to resolve dependency conflicts.
+>
+> Please refer to the upstream project for the original implementation.
+
+
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/cisco-ai-skill-scanner.svg)](https://pypi.org/project/cisco-ai-skill-scanner/)
