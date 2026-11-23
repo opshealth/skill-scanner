@@ -19,7 +19,7 @@ Data models for agent skills and security findings.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -84,9 +84,10 @@ class SkillManifest:
         if self.allowed_tools is None:
             self.allowed_tools = []
         elif isinstance(self.allowed_tools, str):
-            # Agent skill docs commonly show comma-separated tool lists in YAML frontmatter
-            # (e.g., "allowed-tools: Read, Grep, Glob"). Treat this as a list.
-            parts = [p.strip() for p in self.allowed_tools.split(",")]
+            # Agent skill docs show comma-separated or space-separated tool lists in YAML frontmatter
+            # (e.g., "allowed-tools: Read, Grep, Glob" or "allowed-tools: Read Grep Glob").
+            sep = "," if "," in self.allowed_tools else None
+            parts = [p.strip() for p in self.allowed_tools.split(sep)]
             self.allowed_tools = [p for p in parts if p]
 
     @property
@@ -150,6 +151,16 @@ class Skill:
     instruction_body: str
     files: list[SkillFile] = field(default_factory=list)
     referenced_files: list[str] = field(default_factory=list)
+    # Number of physical source lines stripped before ``instruction_body``.
+    # Signature matches add this zero-based offset to their body-relative line
+    # number so finding identities point back to the original SKILL.md.
+    instruction_body_line_offset: int = 0
+    # False only when the scanner recovered an inert body after the strict
+    # manifest parser rejected missing/malformed metadata.  Analyzers may
+    # still inspect package content, but must not infer capability declarations
+    # from the synthesized manifest.
+    manifest_complete: bool = True
+    load_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -210,13 +221,18 @@ class ScanResult:
     skill_name: str
     skill_directory: str
     findings: list[Finding] = field(default_factory=list)
+    # Findings removed by a scoped policy suppression.  Kept out of ``findings``
+    # so verdicts, counters, and exit codes reflect the post-suppression set,
+    # but retained here (and in SARIF) so the decision stays auditable.
+    suppressed_findings: list[Finding] = field(default_factory=list)
     scan_duration_seconds: float = 0.0
     analyzers_used: list[str] = field(default_factory=list)
     analyzers_failed: list[dict[str, str]] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     analyzability_score: float | None = None
     analyzability_details: dict[str, Any] | None = None
     scan_metadata: dict[str, Any] | None = None
+    llm_usage: dict[str, int] | None = None
 
     @property
     def is_safe(self) -> bool:
@@ -264,6 +280,10 @@ class ScanResult:
         }
         if self.analyzers_failed:
             result["analyzers_failed"] = self.analyzers_failed
+        if self.llm_usage:
+            result["llm_usage"] = self.llm_usage
+        if self.suppressed_findings:
+            result["suppressed_findings"] = [f.to_dict() for f in self.suppressed_findings]
         return result
 
 
@@ -282,7 +302,7 @@ class Report:
     safe_count: int = 0
     skills_skipped: list[dict[str, str]] = field(default_factory=list)
     cross_skill_findings: list[Finding] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def _increment_severity_counters(self, findings: list[Finding]) -> None:
         for finding in findings:

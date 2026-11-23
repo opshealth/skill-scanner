@@ -12,6 +12,7 @@
 #   2. Add an entry below with at least: source, knobs.enabled
 #   3. Run `make test` – the audit test will catch missing entries
 
+schema_version: 2
 name: core
 version: "1.0"
 description: "Built-in detection rules for skill-scanner"
@@ -26,7 +27,8 @@ rules:
   PROMPT_INJECTION_IGNORE_INSTRUCTIONS:
     source: signature
     category: prompt_injection
-    severity: CRITICAL
+    taxonomy: AISubtech-1.1.1
+    severity: HIGH
     # Knob defaults below are for documentation only.
     # Runtime values come from the policy YAML sections.
     knobs:
@@ -37,7 +39,8 @@ rules:
   PROMPT_INJECTION_UNRESTRICTED_MODE:
     source: signature
     category: prompt_injection
-    severity: CRITICAL
+    taxonomy: AISubtech-1.1.5
+    severity: HIGH
     knobs:
       enabled: true
     description: "Attempts to enter unrestricted mode"
@@ -45,7 +48,8 @@ rules:
   PROMPT_INJECTION_BYPASS_POLICY:
     source: signature
     category: prompt_injection
-    severity: CRITICAL
+    taxonomy: AISubtech-1.1.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Attempts to bypass safety policies"
@@ -53,7 +57,8 @@ rules:
   PROMPT_INJECTION_REVEAL_SYSTEM:
     source: signature
     category: prompt_injection
-    severity: HIGH
+    taxonomy: AISubtech-8.4.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Attempts to reveal system prompts"
@@ -61,7 +66,8 @@ rules:
   PROMPT_INJECTION_CONCEALMENT:
     source: signature
     category: prompt_injection
-    severity: CRITICAL
+    taxonomy: AISubtech-1.1.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Attempts to conceal injected instructions"
@@ -70,6 +76,7 @@ rules:
   COMMAND_INJECTION_EVAL:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.4
     severity: CRITICAL
     knobs:
       enabled: true
@@ -78,7 +85,8 @@ rules:
   COMMAND_INJECTION_OS_SYSTEM:
     source: signature
     category: command_injection
-    severity: HIGH
+    taxonomy: AISubtech-9.1.4
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "os.system() or subprocess with shell=True"
@@ -86,6 +94,7 @@ rules:
   COMMAND_INJECTION_SHELL_TRUE:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.4
     severity: HIGH
     knobs:
       enabled: true
@@ -94,6 +103,7 @@ rules:
   COMMAND_INJECTION_USER_INPUT:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.4
     severity: HIGH
     knobs:
       enabled: true
@@ -102,6 +112,7 @@ rules:
   COMMAND_INJECTION_JS_CHILD_PROCESS:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.4
     severity: CRITICAL
     knobs:
       enabled: true
@@ -110,6 +121,7 @@ rules:
   COMMAND_INJECTION_JS_FUNCTION_CONSTRUCTOR:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.4
     severity: CRITICAL
     knobs:
       enabled: true
@@ -119,7 +131,8 @@ rules:
   PATH_TRAVERSAL_OPEN:
     source: signature
     category: command_injection
-    severity: HIGH
+    taxonomy: AISubtech-9.1.2
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Path traversal in file operations"
@@ -128,7 +141,8 @@ rules:
   SQL_INJECTION_STRING_FORMAT:
     source: signature
     category: command_injection
-    severity: HIGH
+    taxonomy: AISubtech-9.1.4
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "SQL queries built with string formatting"
@@ -137,6 +151,7 @@ rules:
   DATA_EXFIL_NETWORK_REQUESTS:
     source: signature
     category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
     severity: MEDIUM
     knobs:
       enabled: true
@@ -145,7 +160,8 @@ rules:
   DATA_EXFIL_HTTP_POST:
     source: signature
     category: data_exfiltration
-    severity: HIGH
+    taxonomy: AISubtech-8.2.3
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "HTTP POST requests to external endpoints"
@@ -153,22 +169,54 @@ rules:
   DATA_EXFIL_SOCKET_CONNECT:
     source: signature
     category: data_exfiltration
-    severity: HIGH
+    taxonomy: AISubtech-8.2.3
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Raw socket connections"
 
+  DATA_EXFIL_ENV_VARS:
+    source: signature
+    category: data_exfiltration
+    taxonomy: AISubtech-14.1.1
+    severity: MEDIUM
+    knobs:
+      enabled: true
+    description: "Bulk process environment snapshot can expose credentials and tokens"
+
+  DATA_EXFIL_ENV_DUMP:
+    source: signature
+    category: data_exfiltration
+    taxonomy: AISubtech-14.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+      skip_in_docs: true
+    description: "Enumerates or serialises the entire process environment (credential exposure)"
+
   DATA_EXFIL_SENSITIVE_FILES:
     source: signature
     category: data_exfiltration
-    severity: CRITICAL
+    taxonomy: AISubtech-14.1.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Access to sensitive system files"
 
+  DATA_EXFIL_SENSITIVE_FILE_GLOB:
+    source: python
+    analyzer: static
+    category: data_exfiltration
+    taxonomy: AISubtech-14.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Dynamic enumeration of sensitive credential and configuration files"
+
   DATA_EXFIL_BASE64_AND_NETWORK:
     source: signature
     category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
     severity: HIGH
     knobs:
       enabled: true
@@ -177,6 +225,7 @@ rules:
   DATA_EXFIL_JS_NETWORK:
     source: signature
     category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
     severity: MEDIUM
     knobs:
       enabled: true
@@ -185,15 +234,17 @@ rules:
   DATA_EXFIL_JS_FS_ACCESS:
     source: signature
     category: data_exfiltration
-    severity: HIGH
+    taxonomy: AISubtech-8.2.3
+    severity: LOW
     knobs:
       enabled: true
-    description: "Node.js filesystem access to sensitive data"
+    description: "Node.js filesystem access candidate for sensitive-flow correlation"
 
   # --- Tool abuse ---
   TOOL_ABUSE_SYSTEM_PACKAGE_INSTALL:
     source: signature
     category: unauthorized_tool_use
+    taxonomy: AISubtech-9.1.2
     severity: MEDIUM
     knobs:
       enabled: true
@@ -202,6 +253,7 @@ rules:
   TOOL_ABUSE_UNTRUSTED_PACKAGE_SOURCE:
     source: signature
     category: unauthorized_tool_use
+    taxonomy: AISubtech-9.3.1
     severity: HIGH
     knobs:
       enabled: true
@@ -210,7 +262,8 @@ rules:
   TOOL_ABUSE_SYSTEM_MODIFICATION:
     source: signature
     category: unauthorized_tool_use
-    severity: HIGH
+    taxonomy: AISubtech-9.1.2
+    severity: CRITICAL
     knobs:
       enabled: true
       skip_in_docs: true
@@ -220,6 +273,7 @@ rules:
   OBFUSCATION_BASE64_LARGE:
     source: signature
     category: obfuscation
+    taxonomy: AISubtech-9.2.1
     severity: MEDIUM
     knobs:
       enabled: true
@@ -228,6 +282,7 @@ rules:
   OBFUSCATION_HEX_BLOB:
     source: signature
     category: obfuscation
+    taxonomy: AISubtech-9.2.1
     severity: MEDIUM
     knobs:
       enabled: true
@@ -236,7 +291,8 @@ rules:
   OBFUSCATION_XOR_ENCODING:
     source: signature
     category: obfuscation
-    severity: HIGH
+    taxonomy: AISubtech-9.2.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "XOR encoding/decoding operations"
@@ -244,7 +300,8 @@ rules:
   OBFUSCATION_BINARY_FILE:
     source: signature
     category: obfuscation
-    severity: MEDIUM
+    taxonomy: AISubtech-9.2.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Binary file operation patterns"
@@ -253,6 +310,7 @@ rules:
   SECRET_AWS_KEY:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -261,6 +319,7 @@ rules:
   SECRET_STRIPE_KEY:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -269,6 +328,7 @@ rules:
   SECRET_GOOGLE_API:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -277,6 +337,7 @@ rules:
   SECRET_GITHUB_TOKEN:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -285,6 +346,7 @@ rules:
   SECRET_JWT_TOKEN:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: HIGH
     knobs:
       enabled: true
@@ -293,6 +355,7 @@ rules:
   SECRET_PRIVATE_KEY:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -301,7 +364,8 @@ rules:
   SECRET_PASSWORD_VAR:
     source: signature
     category: hardcoded_secrets
-    severity: HIGH
+    taxonomy: AISubtech-14.1.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Password stored in variable"
@@ -309,6 +373,7 @@ rules:
   SECRET_CONNECTION_STRING:
     source: signature
     category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
     severity: HIGH
     knobs:
       enabled: true
@@ -317,18 +382,26 @@ rules:
 
   # --- Social engineering ---
   SOCIAL_ENG_VAGUE_DESCRIPTION:
-    source: signature
+    source: python
+    analyzer: static
     category: social_engineering
-    severity: MEDIUM
+    taxonomy: AISubtech-4.3.5
+    severity: LOW
     knobs:
       enabled: true
       min_description_length: 20    # Minimum chars before flagging
     description: "Overly vague skill description"
 
   SOCIAL_ENG_ANTHROPIC_IMPERSONATION:
-    source: signature
+    source: python
+    analyzer: static
     category: social_engineering
+    taxonomy: AISubtech-3.1.2
+    # Maximum severity; generic branding references emit MEDIUM while an
+    # explicit false "official" claim emits HIGH.
     severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
     knobs:
       enabled: true
     description: "Impersonation of Anthropic/Claude branding"
@@ -337,7 +410,8 @@ rules:
   RESOURCE_ABUSE_INFINITE_LOOP:
     source: signature
     category: resource_abuse
-    severity: MEDIUM
+    taxonomy: AISubtech-13.1.1
+    severity: HIGH
     knobs:
       enabled: true
       exception_handler_context_lines: 20  # Lines after loop to scan for exception handlers
@@ -346,6 +420,7 @@ rules:
   RESOURCE_ABUSE_FORK_BOMB:
     source: signature
     category: resource_abuse
+    taxonomy: AISubtech-13.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -354,15 +429,38 @@ rules:
   RESOURCE_ABUSE_LARGE_ALLOCATION:
     source: signature
     category: resource_abuse
-    severity: MEDIUM
+    taxonomy: AISubtech-13.1.2
+    severity: HIGH
     knobs:
       enabled: true
     description: "Large memory allocation"
+
+  # --- Harmful content and malware ---
+  HARMFUL_CONTENT_EXPLICIT_INSTRUCTION:
+    source: signature
+    category: harmful_content
+    taxonomy: AISubtech-15.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+      skip_in_docs: true
+    description: "Imperative request to create a concrete prohibited cyber-harm capability"
+
+  MALWARE_RANSOMWARE_IMPLEMENTATION_CHAIN:
+    source: signature
+    category: malware
+    taxonomy: AISubtech-15.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+      skip_in_docs: true
+    description: "Ransomware implementation chain with enumeration, encryption, and extortion artifact"
 
   # --- File-type specific signatures ---
   SVG_EMBEDDED_SCRIPT:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.4
     severity: CRITICAL
     knobs:
       enabled: true
@@ -371,6 +469,7 @@ rules:
   PDF_EMBEDDED_JAVASCRIPT:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.1
     severity: CRITICAL
     knobs:
       enabled: true
@@ -379,7 +478,20 @@ rules:
   GLOB_HIDDEN_FILE_TARGETING:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.2
     severity: MEDIUM
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "signature_pattern" ||
+        f.candidate.context_kind == "active_instruction" ||
+        f.candidate.context_kind == "code" ||
+        f.candidate.context_kind == "unknown" ||
+        (f.candidate.context_kind != "prohibition" &&
+         f.candidate.context_kind != "negative_example" &&
+         f.candidate.file.role != "documentation" &&
+         f.candidate.file.role != "test_or_example")
     knobs:
       enabled: true
     description: "Commands targeting hidden files via glob or ls -a"
@@ -387,14 +499,28 @@ rules:
   FIND_EXEC_PATTERN:
     source: signature
     category: command_injection
+    taxonomy: AISubtech-9.1.1
     severity: HIGH
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "signature_pattern" ||
+        f.candidate.context_kind == "active_instruction" ||
+        f.candidate.context_kind == "code" ||
+        f.candidate.context_kind == "unknown" ||
+        (f.candidate.context_kind != "prohibition" &&
+         f.candidate.context_kind != "negative_example" &&
+         f.candidate.file.role != "documentation" &&
+         f.candidate.file.role != "test_or_example")
     knobs:
       enabled: true
     description: "find command with -exec flag"
 
   HIDDEN_FILE_WITH_CODE:
     source: signature
-    category: obfuscation
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.2.1
     severity: HIGH
     knobs:
       enabled: true
@@ -407,24 +533,59 @@ rules:
 
   YARA_embedded_elf_binary:
     source: yara
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Embedded ELF binary detected in file"
 
   YARA_embedded_pe_executable:
     source: yara
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Embedded PE (Windows) executable detected in file"
 
   YARA_embedded_macho_binary:
     source: yara
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Embedded Mach-O binary detected in file"
 
   YARA_embedded_shebang_in_binary:
     source: yara
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.2.1
+    severity: MEDIUM
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "binary_signature" ||
+        f.candidate.context_kind != "binary" ||
+        (f.candidate.evidence_value_class != "embedded_shebang_offset_65_4095" &&
+         f.candidate.evidence_value_class != "embedded_shebang_offset_4096_plus") ||
+        (f.candidate.evidence_value_class == "embedded_shebang_offset_65_4095" &&
+         f.candidate.evidence_count < 65u) ||
+        (f.candidate.evidence_value_class == "embedded_shebang_offset_4096_plus" &&
+         f.candidate.evidence_count != 4096u) ||
+        f.candidate.file.kind != "binary" ||
+        f.candidate.file.analyzable ||
+        f.candidate.file.hidden ||
+        f.candidate.file.executable ||
+        f.candidate.file.magic_mismatch ||
+        "FILE_MAGIC_MISMATCH" in f.candidate.cooccurring_rule_ids ||
+        (f.candidate.file.referenced &&
+         f.candidate.file.role != "asset" &&
+         f.candidate.file.role != "documentation" &&
+         f.candidate.file.role != "test_or_example") ||
+        f.candidate.cooccurring_rule_ids.exists(r, r.startsWith("YARA_"))
     knobs:
       enabled: true
       skip_inert_extensions: true
@@ -432,6 +593,9 @@ rules:
 
   YARA_tool_chaining_abuse_generic:
     source: yara
+    category: tool_chaining_abuse
+    taxonomy: AISubtech-8.2.3
+    severity: MEDIUM
     knobs:
       enabled: true
       exfil_hints: "send,upload,transmit,webhook,slack,exfil,forward"  # Comma-separated exfil hint words
@@ -440,80 +604,217 @@ rules:
 
   YARA_system_manipulation_generic:
     source: yara
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-9.1.2
+    severity: HIGH
     knobs:
       enabled: true
     description: "System manipulation patterns"
 
   YARA_sql_injection_generic:
     source: yara
+    category: command_injection
+    taxonomy: AISubtech-9.1.4
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "SQL injection patterns"
 
   YARA_script_injection_generic:
     source: yara
+    category: command_injection
+    taxonomy: AISubtech-9.1.4
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Script injection patterns"
 
   YARA_prompt_injection_unicode_steganography:
     source: yara
+    category: unicode_steganography
+    taxonomy: AISubtech-1.1.2
+    severity: MEDIUM
     knobs:
       enabled: true
       zerowidth_threshold_with_decode: 50   # Zero-width chars threshold when decode context present
       zerowidth_threshold_alone: 200        # Zero-width chars threshold without decode context
       short_match_max_chars: 2              # Max matched chars to consider "short" (filtered in non-Latin)
       cyrillic_cjk_min_chars: 10            # Min matched chars to keep in Cyrillic/CJK context
-    description: "Unicode steganography in prompts"
+    description: "Unicode steganography and ASCII smuggling in prompts (detects Tag Block U+E0000-U+E007F)"
 
   YARA_prompt_injection_generic:
     source: yara
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Generic prompt injection patterns"
 
   YARA_indirect_prompt_injection_generic:
     source: yara
+    category: transitive_trust_abuse
+    taxonomy: AITech-1.2
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Indirect prompt injection patterns"
 
   YARA_credential_harvesting_generic:
     source: yara
+    category: hardcoded_secrets
+    taxonomy: AISubtech-14.1.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Credential harvesting patterns"
 
   YARA_command_injection_generic:
     source: yara
+    category: command_injection
+    taxonomy: AISubtech-9.1.4
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Command injection patterns"
 
   YARA_coercive_injection_generic:
     source: yara
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Coercive injection patterns"
 
   YARA_code_execution_generic:
     source: yara
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Generic code execution patterns"
 
   YARA_capability_inflation_generic:
     source: yara
+    category: skill_discovery_abuse
+    taxonomy: AISubtech-4.3.5
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Capability inflation patterns"
 
   YARA_autonomy_abuse_generic:
     source: yara
+    category: autonomy_abuse
+    taxonomy: AISubtech-2.1.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Autonomy abuse patterns"
 
+  YARA_jailbreak_generic:
+    source: yara
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.5
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Jailbreak attempt patterns"
+
+  YARA_SUSP_Lnx_EncodedShell_DecodeExec_Sep26:
+    source: yara
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects an encoded shell payload decoded directly into a command interpreter"
+
+  YARA_SUSP_Win_EncodedPowerShell_Exec_Sep26:
+    source: yara
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects PowerShell executing a long base64-encoded command after bounded runtime flags"
+
+  YARA_SUSP_Multi_RawIP_DownloadExec_Sep26:
+    source: yara
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects a downloader piping a payload from a raw IPv4 host directly into an interpreter"
+
+  YARA_SUSP_Multi_CredentialExfil_Chain_Sep26:
+    source: yara
+    category: data_exfiltration
+    taxonomy: AISubtech-14.1.1
+    severity: CRITICAL
+    knobs:
+      enabled: true
+    description: "Detects credential-file reads followed by writes to an attacker-style external endpoint"
+
+  YARA_SUSP_Multi_EncodedArchive_Exec_Sep26:
+    source: yara
+    category: malware
+    taxonomy: AISubtech-15.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects a decoded archive extracted to a hidden temporary stage and then executed"
+
+  YARA_SUSP_Multi_Cryptomining_ConfigExec_Sep26:
+    source: yara
+    category: resource_abuse
+    taxonomy: AISubtech-13.2.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects an executable cryptomining configuration with a remote pool"
+
+  YARA_SUSP_Multi_Cron_C2_Persistence_Sep26:
+    source: yara
+    category: malware
+    taxonomy: AISubtech-15.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects a C2-backed cron configuration executed through a persistence script"
+
+  YARA_SUSP_Multi_RemoteMiner_AcquireExec_Sep26:
+    source: yara
+    category: resource_abuse
+    taxonomy: AISubtech-13.2.1
+    severity: HIGH
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "correlated_behavior" ||
+        f.candidate.evidence_value_class != "remote_miner_acquire_execute" ||
+        f.candidate.context_kind == "active_instruction" ||
+        f.candidate.context_kind == "code" ||
+        f.candidate.context_kind == "unknown" ||
+        (f.candidate.context_kind != "prohibition" &&
+         f.candidate.context_kind != "negative_example" &&
+         f.candidate.context_kind != "example")
+    knobs:
+      enabled: true
+    description: "Detects explicit acquisition and execution of a cryptomining payload"
+
+  YARA_SUSP_Multi_RemoteConfig_StageExec_Sep26:
+    source: yara
+    category: malware
+    taxonomy: AISubtech-15.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Detects a remotely staged configuration followed by execution of a temporary runner"
 
   # ===========================================================================
   # PYTHON RULES – Static Analyzer
@@ -522,6 +823,9 @@ rules:
   MANIFEST_INVALID_NAME:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
     knobs:
       enabled: true
       max_name_length: 64              # Maximum allowed skill name length
@@ -530,6 +834,9 @@ rules:
   MANIFEST_DESCRIPTION_TOO_LONG:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: LOW
     knobs:
       enabled: true
       max_description_length: 1024     # Maximum allowed description length in chars
@@ -538,6 +845,9 @@ rules:
   MANIFEST_MISSING_LICENSE:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
     knobs:
       enabled: true
     description: "Skill package is missing a license file"
@@ -545,20 +855,85 @@ rules:
   TOOL_ABUSE_UNDECLARED_NETWORK:
     source: python
     analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Skill uses network but doesn't declare it"
 
+  UNDECLARED_NETWORK_DESTINATION:
+    source: python
+    analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-9.1.3
+    # LOW until its real-skill flag rate is measured: a script calling any API its
+    # SKILL.md does not name fires it, so at MEDIUM it would gate ordinary skills.
+    severity: LOW
+    # Destination-oriented "intent vs implementation" check: a script contacts or
+    # configures a literal host that the documentation never names. Complements
+    # TOOL_ABUSE_UNDECLARED_NETWORK (which is capability-oriented). Enabled in the
+    # balanced default and strict presets; disabled in the noise-reduction presets
+    # (permissive/low-noise/quiet) as it is more false-positive prone than most
+    # rules (see data/*_policy.yaml disabled_rules).
+    knobs:
+      enabled: true
+    description: "Script contacts or configures a host the documentation never mentions"
+
   SOCIAL_ENG_MISLEADING_DESC:
     source: python
     analyzer: static
+    category: social_engineering
+    taxonomy: AISubtech-4.3.5
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Description does not match actual behavior"
 
+  SUPPLY_CHAIN_REGISTRY_REDIRECT:
+    source: python
+    analyzer: static
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.3.1
+    # Maximum severity. Registries under the policy's
+    # llm_analysis.trusted_reference_domains are emitted at LOW.
+    severity: HIGH
+    allowed_severity_demotions:
+      - LOW
+    knobs:
+      enabled: true
+    description: "Package-manager registry/index redirected to a non-default host"
+
+  SUPPLY_CHAIN_UNPINNED_DEPENDENCY:
+    source: python
+    analyzer: static
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.3.3
+    # Maximum severity. Emitted at LOW for both unpinned and wildcard ranges: an
+    # unpinned dependency is hygiene, and supply-chain threat signals are separate rules.
+    severity: MEDIUM
+    allowed_severity_demotions:
+      - LOW
+    knobs:
+      enabled: true
+    description: "Skill declares a dependency without an exact pinned version"
+
+  CONFIG_SUSPICIOUS_URL:
+    source: python
+    analyzer: static
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Configuration file references a URL on a known suspicious/tunnel domain"
+
   LAZY_LOAD_DEEP_NESTING:
     source: python
     analyzer: static
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: MEDIUM
     knobs:
       enabled: true
       max_reference_depth: 5
@@ -567,6 +942,15 @@ rules:
   FILE_MAGIC_MISMATCH:
     source: python
     analyzer: static
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    # Maximum base severity. Binary or cross-family content emits MEDIUM, HIGH or CRITICAL;
+    # a text label that differs from the extension's (Python read from a .md) emits LOW.
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+      - MEDIUM
+      - LOW
     knobs:
       enabled: true
       min_confidence_pct: 80           # Minimum magic detection confidence (0-100) to trigger
@@ -577,6 +961,9 @@ rules:
   ARCHIVE_FILE_DETECTED:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Archive file detected in skill package"
@@ -584,13 +971,51 @@ rules:
   BINARY_FILE_DETECTED:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: AISubtech-9.2.1
+    severity: INFO
     knobs:
       enabled: true
     description: "Binary file detected in skill package"
 
+  PICKLE_FILE_DETECTED:
+    source: python
+    analyzer: static
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+    knobs:
+      enabled: true
+    description: "Executable Python pickle detected"
+
+  UNICODE_OBFUSCATED_INSTRUCTION:
+    source: python
+    analyzer: static
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.2
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Obfuscated prompt-injection instructions detected"
+
+  UNICODE_ANALYSIS_INCOMPLETE:
+    source: python
+    analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
+    knobs:
+      enabled: true
+    description: "Unicode instruction analysis stopped at its deterministic work limit"
+
   PYCACHE_FILES_DETECTED:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: LOW
     knobs:
       enabled: true
     description: "Python cache files detected"
@@ -598,6 +1023,22 @@ rules:
   HIDDEN_EXECUTABLE_SCRIPT:
     source: python
     analyzer: static
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "file_inventory" ||
+        f.candidate.context_kind != "code" ||
+        !f.candidate.file.hidden ||
+        f.candidate.file.executable ||
+        (f.candidate.file.referenced &&
+         f.candidate.file.role != "asset" &&
+         f.candidate.file.role != "documentation" &&
+         f.candidate.file.role != "test_or_example") ||
+        f.candidate.cooccurring_rule_ids.exists(r, r != "BINARY_FILE_DETECTED")
     knobs:
       enabled: true
     description: "Hidden file containing executable code"
@@ -605,6 +1046,9 @@ rules:
   HIDDEN_DATA_FILE:
     source: python
     analyzer: static
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: LOW
     knobs:
       enabled: true
     description: "Hidden data file detected"
@@ -612,6 +1056,9 @@ rules:
   ALLOWED_TOOLS_READ_VIOLATION:
     source: python
     analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Skill uses read operations not in allowed tools"
@@ -619,6 +1066,9 @@ rules:
   ALLOWED_TOOLS_WRITE_VIOLATION:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: AISubtech-2.1.2
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Skill uses write operations not in allowed tools"
@@ -626,6 +1076,9 @@ rules:
   ALLOWED_TOOLS_BASH_VIOLATION:
     source: python
     analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: HIGH
     knobs:
       enabled: true
     description: "Skill uses bash operations not in allowed tools"
@@ -633,6 +1086,9 @@ rules:
   ALLOWED_TOOLS_GREP_VIOLATION:
     source: python
     analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: LOW
     knobs:
       enabled: true
     description: "Skill uses grep operations not in allowed tools"
@@ -640,6 +1096,9 @@ rules:
   ALLOWED_TOOLS_GLOB_VIOLATION:
     source: python
     analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: LOW
     knobs:
       enabled: true
     description: "Skill uses glob operations not in allowed tools"
@@ -647,6 +1106,18 @@ rules:
   ALLOWED_TOOLS_NETWORK_USAGE:
     source: python
     analyzer: static
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: MEDIUM
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "capability_mismatch" ||
+        f.candidate.context_kind != "manifest" ||
+        f.candidate.flow.source_class != "skill_code" ||
+        f.candidate.flow.sink_class != "external_network" ||
+        !f.skill.declares_network
     knobs:
       enabled: true
     description: "Skill uses network operations not in allowed tools"
@@ -654,6 +1125,14 @@ rules:
   PDF_STRUCTURAL_THREAT:
     source: python
     analyzer: static
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    # Maximum base severity; individual PDF structures range LOW-CRITICAL.
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+      - MEDIUM
+      - LOW
     knobs:
       enabled: true
     description: "Suspicious structural elements in PDF file"
@@ -661,13 +1140,33 @@ rules:
   OFFICE_DOCUMENT_THREAT:
     source: python
     analyzer: static
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.1.1
+    # Maximum base severity; encryption and non-macro indicators are lower.
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+      - MEDIUM
     knobs:
       enabled: true
     description: "Suspicious OLE/VBA content in Office document"
 
+  ASCII_SMUGGLING_TAG_BLOCK:
+    source: python
+    analyzer: static
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.2
+    severity: CRITICAL
+    knobs:
+      enabled: true
+    description: "Unicode Tag Block characters (U+E0000-U+E007F) used for ASCII smuggling / hidden prompt injection"
+
   HOMOGLYPH_ATTACK:
     source: python
     analyzer: static
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
       min_dangerous_lines: 5
@@ -678,6 +1177,9 @@ rules:
   EXCESSIVE_FILE_COUNT:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: LOW
     knobs:
       enabled: true
       max_file_count: 100              # Files above this threshold trigger finding
@@ -686,6 +1188,9 @@ rules:
   OVERSIZED_FILE:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: LOW
     knobs:
       enabled: true
       max_file_size_bytes: 5242880     # 5 MB — files above this trigger finding
@@ -694,6 +1199,9 @@ rules:
   ARCHIVE_CONTAINS_EXECUTABLE:
     source: python
     analyzer: static
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Archive contains executable script"
@@ -701,6 +1209,12 @@ rules:
   ASSET_PROMPT_INJECTION:
     source: python
     analyzer: static
+    category: prompt_injection
+    taxonomy: AITech-1.2
+    # Maximum base severity; role-switch variants emit MEDIUM.
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
     knobs:
       enabled: true
       asset_prompt_injection_skip_in_docs: true
@@ -709,9 +1223,32 @@ rules:
   ASSET_SUSPICIOUS_URL:
     source: python
     analyzer: static
+    category: policy_violation
+    taxonomy: AISubtech-8.2.3
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Suspicious URL in asset file"
+
+  PATH_TRAVERSAL_ATTEMPT:
+    source: python
+    analyzer: static
+    category: data_exfiltration
+    taxonomy: AISubtech-9.1.2
+    severity: CRITICAL
+    knobs:
+      enabled: true
+    description: "Path traversal in skill references or dependency declarations"
+
+  SUPPLY_CHAIN_KNOWN_VULNERABILITY:
+    source: python
+    analyzer: osv
+    category: supply_chain_attack
+    taxonomy: AITech-9.3
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Dependency is affected by a known vulnerability reported by OSV"
 
   # ===========================================================================
   # PYTHON RULES – Pipeline Analyzer
@@ -720,6 +1257,15 @@ rules:
   PIPELINE_TAINT_FLOW:
     source: python
     analyzer: pipeline
+    # Highest-impact base identity. Runtime category follows the source/sink
+    # pair and severity ranges MEDIUM-CRITICAL before documentation demotions.
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+      - MEDIUM
+      - LOW
     knobs:
       enabled: true
       demote_instructional: true       # Demote instructional install text in SKILL.md
@@ -729,14 +1275,37 @@ rules:
   COMPOUND_FIND_EXEC:
     source: python
     analyzer: pipeline
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    # Base severity; documentation context can demote this to MEDIUM.
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - MEDIUM
     knobs:
       enabled: true
       demote_in_docs: true             # Demote findings in documentation/reference files
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "command_sequence" ||
+        f.candidate.context_kind != "documentation" ||
+        f.candidate.flow.source_class != "filesystem" ||
+        f.candidate.flow.sink_class != "execution" ||
+        f.candidate.command.executable != "find" ||
+        !f.candidate.command.executes ||
+        !("exec_action" in f.candidate.command.argument_classes)
     description: "find command piped to execution"
 
   COMPOUND_EXTRACT_EXECUTE:
     source: python
     analyzer: pipeline
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.1.1
+    # Base severity; documentation context can demote this to LOW.
+    severity: HIGH
+    allowed_severity_demotions:
+      - LOW
     knobs:
       enabled: true
       demote_in_docs: true             # Demote findings in documentation/reference files
@@ -745,6 +1314,12 @@ rules:
   COMPOUND_FETCH_EXECUTE:
     source: python
     analyzer: pipeline
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    # Base severity; documentation and known-installer context can demote it.
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - MEDIUM
     knobs:
       enabled: true
       check_known_installers: true
@@ -753,16 +1328,120 @@ rules:
       compound_fetch_filter_api_requests: true
       compound_fetch_filter_shell_wrapped_fetch: true
       compound_fetch_exec_prefixes: "sudo,env,command,time,nohup,nice"
-      compound_fetch_exec_commands: "bash,sh,zsh,source,python,python3,."
-    description: "Remote fetch followed by execution (curl|sh)"
+      compound_fetch_exec_commands: "bash,sh,zsh,powershell,pwsh,source,python,python3,."
+    description: "Remote fetch followed by interpreter execution"
 
   COMPOUND_LAUNDERING_CHAIN:
     source: python
     analyzer: pipeline
+    category: command_injection
+    taxonomy: AISubtech-9.2.1
+    # Base severity; documentation context can demote this to LOW.
+    severity: HIGH
+    allowed_severity_demotions:
+      - LOW
     knobs:
       enabled: true
       demote_in_docs: true             # Demote findings in documentation/reference files
     description: "Data laundering through multiple transforms"
+
+  # ===========================================================================
+  # PYTHON RULES – Correlation Analyzer
+  # ===========================================================================
+
+  CORRELATED_SENSITIVE_NETWORK_FLOW:
+    source: python
+    analyzer: correlation
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Sensitive data reaches an outbound network sink (MEDIUM–HIGH based on destination risk)"
+
+  CORRELATED_NETWORK_EXECUTION_FLOW:
+    source: python
+    analyzer: correlation
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Network-derived content reaches code execution (MEDIUM–HIGH based on origin and flow)"
+
+  CORRELATED_NETWORK_FILE_WRITE_FLOW:
+    source: python
+    analyzer: correlation
+    category: malware
+    taxonomy: AISubtech-15.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Network-derived bytes reach a dynamically selected binary file destination"
+
+  CORRELATED_OBFUSCATION_EXECUTION_FLOW:
+    source: python
+    analyzer: correlation
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Decoded or unpacked content reaches code execution (MEDIUM–HIGH based on flow distance)"
+
+  CORRELATED_HIDDEN_EXECUTABLE:
+    source: python
+    analyzer: correlation
+    category: malware
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Hidden, undeclared executable is connected to suspicious behavior (MEDIUM–HIGH)"
+
+  CORRELATED_CONFIG_URL_EXECUTION:
+    source: python
+    analyzer: correlation
+    category: supply_chain_attack
+    taxonomy: AISubtech-9.1.1
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Configuration-controlled URL reaches code execution (MEDIUM–HIGH based on origin risk)"
+
+  CORRELATED_NESTED_ARCHIVE_SCRIPT:
+    source: python
+    analyzer: correlation
+    category: malware
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Nested archive contains an undeclared script (MEDIUM–HIGH based on behavior)"
+
+  CORRELATED_MANIFEST_CAPABILITY_MISMATCH:
+    source: python
+    analyzer: correlation
+    category: unauthorized_tool_use
+    taxonomy: AISubtech-2.1.2
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Observed behavior exceeds declared skill capabilities (MEDIUM–HIGH based on breadth and flow)"
 
   # ===========================================================================
   # PYTHON RULES – Scanner (analyzability)
@@ -770,7 +1449,27 @@ rules:
 
   UNANALYZABLE_BINARY:
     source: python
-    analyzer: scanner
+    analyzer: analyzability
+    category: policy_violation
+    taxonomy: AISubtech-9.2.1
+    severity: MEDIUM
+    cel:
+      fact_schema: v1
+      rollout: shadow
+      expression: |
+        f.candidate.evidence_kind != "file_analyzability" ||
+        f.candidate.evidence_value_class != "opaque_binary" ||
+        f.candidate.context_kind != "binary" ||
+        (!f.candidate.file.analyzable &&
+         (f.candidate.file.hidden ||
+          f.candidate.file.executable ||
+          f.candidate.file.magic_mismatch ||
+          "FILE_MAGIC_MISMATCH" in f.candidate.cooccurring_rule_ids ||
+          (f.candidate.file.referenced &&
+           f.candidate.file.role != "asset" &&
+           f.candidate.file.role != "documentation" &&
+           f.candidate.file.role != "test_or_example") ||
+          f.candidate.cooccurring_rule_ids.exists(r, r.startsWith("YARA_"))))
     knobs:
       enabled: true
       skip_inert_extensions: true
@@ -778,14 +1477,67 @@ rules:
 
   LOW_ANALYZABILITY:
     source: python
-    analyzer: scanner
+    analyzer: analyzability
+    category: policy_violation
+    taxonomy: AISubtech-9.2.1
+    # Maximum base severity; moderately incomplete scans emit MEDIUM.
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
     knobs:
       enabled: true
     description: "Overall analyzability score is below threshold"
 
+  SKILL_LOAD_FALLBACK_USED:
+    source: python
+    analyzer: skill_loader
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
+    knobs:
+      enabled: true
+    description: "Strict manifest loading failed and bounded inert raw-body analysis was used"
+
+  SKILL_LOAD_REJECTED_LIMIT:
+    source: python
+    analyzer: skill_loader
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Skill manifest exceeded the hard loader size limit and was blocked without reading content"
+
+  SYMLINK_NOT_SCANNED:
+    source: python
+    analyzer: skill_loader
+    category: policy_violation
+    taxonomy: AISubtech-9.2.1
+    # Maximum severity; a symlink whose target leaves the skill root emits HIGH,
+    # one that stays inside the skill emits MEDIUM.
+    severity: HIGH
+    allowed_severity_demotions:
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "Symlink inside the skill was not followed, so its content was not analyzed"
+
+  SKILL_LOAD_FAILED:
+    source: python
+    analyzer: skill_loader
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Skill could not be loaded (for example invalid UTF-8 or a symlinked SKILL.md) and was not analyzed"
+
   FINDING_OUTPUT_NORMALIZATION:
     source: python
     analyzer: scanner
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
     knobs:
       enabled: true
       dedupe_exact_findings: true
@@ -808,6 +1560,9 @@ rules:
   TRIGGER_OVERLAP_RISK:
     source: python
     analyzer: scanner
+    category: social_engineering
+    taxonomy: AISubtech-12.1.4
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Cross-skill trigger overlap detected (high risk)"
@@ -815,6 +1570,9 @@ rules:
   TRIGGER_OVERLAP_WARNING:
     source: python
     analyzer: scanner
+    category: social_engineering
+    taxonomy: AISubtech-12.1.4
+    severity: LOW
     knobs:
       enabled: true
     description: "Cross-skill trigger overlap detected (warning)"
@@ -826,6 +1584,9 @@ rules:
   ARCHIVE_EXTRACTION_FAILED:
     source: python
     analyzer: content_extractor
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Archive extraction failed"
@@ -833,6 +1594,9 @@ rules:
   ARCHIVE_NESTED_TOO_DEEP:
     source: python
     analyzer: content_extractor
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Nested archive exceeds depth limit"
@@ -840,6 +1604,9 @@ rules:
   ARCHIVE_ZIP_BOMB:
     source: python
     analyzer: content_extractor
+    category: resource_abuse
+    taxonomy: AISubtech-13.1.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Potential zip bomb detected"
@@ -847,6 +1614,9 @@ rules:
   ARCHIVE_PATH_TRAVERSAL:
     source: python
     analyzer: content_extractor
+    category: command_injection
+    taxonomy: AISubtech-9.1.2
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Archive contains path traversal entries"
@@ -854,6 +1624,9 @@ rules:
   OFFICE_VBA_MACRO:
     source: python
     analyzer: content_extractor
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "VBA macro detected in Office document"
@@ -861,9 +1634,92 @@ rules:
   OFFICE_EMBEDDED_OLE:
     source: python
     analyzer: content_extractor
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Embedded OLE object in Office document"
+
+  ARCHIVE_SYMLINK:
+    source: python
+    analyzer: content_extractor
+    category: command_injection
+    taxonomy: AISubtech-9.1.2
+    severity: CRITICAL
+    knobs:
+      enabled: true
+    description: "Archive contains a symbolic or hard link that may escape extraction boundaries"
+
+  ACTIVE_DYNAMIC_EXECUTION:
+    source: python
+    analyzer: static
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Syntax-confirmed dynamic code or process execution in active SKILL.md instructions"
+
+  ACTIVE_REMOTE_ACQUIRE_EXECUTE:
+    source: python
+    analyzer: static
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Active instruction acquires remote content and executes the same resolved artifact"
+
+  MANDATORY_AUTOMATIC_HELPER_EXECUTION:
+    source: python
+    analyzer: static
+    category: autonomy_abuse
+    taxonomy: AISubtech-2.1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Automatic helper execution coupled to a coercive, concealed, or deceptive instruction condition"
+
+  ACTIVE_OS_PERSISTENCE_DIRECTIVE:
+    source: python
+    analyzer: static
+    category: malware
+    taxonomy: AISubtech-9.1.2
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Active instruction establishes risky operating-system startup or scheduler persistence"
+
+  ACTIVE_SENSITIVE_EXFILTRATION:
+    source: python
+    analyzer: static
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Active instruction sends collected sensitive data to an external or attacker-style destination, or a local credential file to an explicit remote destination"
+
+  ACTIVE_HIDDEN_HTML_INSTRUCTION:
+    source: python
+    analyzer: static
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.2
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Control override plus execution or sensitive-data action concealed by active HTML markup"
+
+  UNICODE_SMUGGLING_ACTIVE_INTENT:
+    source: python
+    analyzer: static
+    category: unicode_steganography
+    taxonomy: AISubtech-1.1.2
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Hidden Unicode controls co-occur with active override or execution intent in SKILL.md"
 
   # ===========================================================================
   # PYTHON RULES – Behavioral Analyzer
@@ -872,6 +1728,9 @@ rules:
   BEHAVIOR_ENV_VAR_EXFILTRATION:
     source: python
     analyzer: behavioral
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Environment variable exfiltration pattern"
@@ -879,6 +1738,9 @@ rules:
   BEHAVIOR_CREDENTIAL_FILE_ACCESS:
     source: python
     analyzer: behavioral
+    category: data_exfiltration
+    taxonomy: AISubtech-14.1.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Credential file access detected"
@@ -886,6 +1748,9 @@ rules:
   BEHAVIOR_ENV_VAR_HARVESTING:
     source: python
     analyzer: behavioral
+    category: data_exfiltration
+    taxonomy: AISubtech-14.1.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Bulk environment variable harvesting"
@@ -893,6 +1758,9 @@ rules:
   BEHAVIOR_SUSPICIOUS_URL:
     source: python
     analyzer: behavioral
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: HIGH
     knobs:
       enabled: true
     description: "Suspicious URL pattern detected"
@@ -900,6 +1768,9 @@ rules:
   BEHAVIOR_EVAL_SUBPROCESS:
     source: python
     analyzer: behavioral
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "eval/exec with subprocess interaction"
@@ -907,6 +1778,14 @@ rules:
   BEHAVIOR_BASH_TAINT_FLOW:
     source: python
     analyzer: behavioral
+    # Highest-impact base identity. Runtime category follows the source/sink
+    # pair and severity ranges MEDIUM-CRITICAL.
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+      - MEDIUM
     knobs:
       enabled: true
     description: "Tainted data in bash code block"
@@ -914,6 +1793,9 @@ rules:
   MDBLOCK_PYTHON_EVAL_EXEC:
     source: python
     analyzer: behavioral
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "eval/exec in markdown Python code block"
@@ -921,6 +1803,9 @@ rules:
   MDBLOCK_PYTHON_SUBPROCESS:
     source: python
     analyzer: behavioral
+    category: command_injection
+    taxonomy: AISubtech-9.1.1
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "subprocess in markdown Python code block"
@@ -928,9 +1813,22 @@ rules:
   MDBLOCK_PYTHON_HTTP_POST:
     source: python
     analyzer: behavioral
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "HTTP POST in markdown Python code block"
+
+  BEHAVIOR_DATAFLOW_ANALYSIS_INCOMPLETE:
+    source: python
+    analyzer: behavioral
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
+    knobs:
+      enabled: true
+    description: "Behavioral dataflow analysis stopped at a configured safety budget"
 
   # ===========================================================================
   # PYTHON RULES – Trigger Analyzer
@@ -939,6 +1837,9 @@ rules:
   TRIGGER_OVERLY_GENERIC:
     source: python
     analyzer: trigger
+    category: social_engineering
+    taxonomy: AISubtech-4.3.5
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Trigger description is too generic"
@@ -946,6 +1847,9 @@ rules:
   TRIGGER_DESCRIPTION_TOO_SHORT:
     source: python
     analyzer: trigger
+    category: social_engineering
+    taxonomy: not_applicable
+    severity: LOW
     knobs:
       enabled: true
     description: "Trigger description is too short"
@@ -953,6 +1857,9 @@ rules:
   TRIGGER_VAGUE_DESCRIPTION:
     source: python
     analyzer: trigger
+    category: social_engineering
+    taxonomy: AISubtech-4.3.5
+    severity: LOW
     knobs:
       enabled: true
     description: "Trigger description is vague"
@@ -960,6 +1867,9 @@ rules:
   TRIGGER_KEYWORD_BAITING:
     source: python
     analyzer: trigger
+    category: social_engineering
+    taxonomy: AISubtech-4.3.5
+    severity: MEDIUM
     knobs:
       enabled: true
     description: "Trigger uses keyword-baiting patterns"
@@ -971,6 +1881,9 @@ rules:
   BYTECODE_NO_SOURCE:
     source: python
     analyzer: bytecode
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
     knobs:
       enabled: true
     description: "Compiled bytecode without matching source"
@@ -978,6 +1891,331 @@ rules:
   BYTECODE_SOURCE_MISMATCH:
     source: python
     analyzer: bytecode
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: CRITICAL
     knobs:
       enabled: true
     description: "Bytecode does not match source code"
+
+  BYTECODE_ANALYSIS_UNAVAILABLE:
+    source: python
+    analyzer: bytecode
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Bytecode integrity could not be verified against matching source"
+
+  # ===========================================================================
+  # PYTHON RULES – Cross-skill Analyzer
+  # ===========================================================================
+
+  CROSS_SKILL_DATA_RELAY:
+    source: python
+    analyzer: cross_skill
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Separate skills form a sensitive-data collection and exfiltration chain"
+
+  CROSS_SKILL_SHARED_URL:
+    source: python
+    analyzer: cross_skill
+    category: data_exfiltration
+    taxonomy: AISubtech-8.2.3
+    severity: MEDIUM
+    knobs:
+      enabled: true
+    description: "Multiple skills reference the same uncommon external domain"
+
+  CROSS_SKILL_COMPLEMENTARY_TRIGGERS:
+    source: python
+    analyzer: cross_skill
+    category: social_engineering
+    taxonomy: AISubtech-19.2.2
+    severity: LOW
+    knobs:
+      enabled: true
+    description: "Skills have complementary trigger descriptions and shared context"
+
+  CROSS_SKILL_SHARED_PATTERN:
+    source: python
+    analyzer: cross_skill
+    category: obfuscation
+    taxonomy: AISubtech-9.2.1
+    severity: MEDIUM
+    knobs:
+      enabled: true
+    description: "Multiple skills share a suspicious code or obfuscation pattern"
+
+  # ===========================================================================
+  # PYTHON RULES – LLM / External Analyzer Operational Findings
+  # ===========================================================================
+
+  LLM_CONTEXT_BUDGET_EXCEEDED:
+    source: python
+    analyzer: llm
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
+    knobs:
+      enabled: true
+    description: "Content was excluded from LLM analysis by a configured context budget"
+
+  LLM_PROMPT_INJECTION_DETECTED:
+    source: python
+    analyzer: llm
+    category: prompt_injection
+    taxonomy: AISubtech-1.1.4
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "Protected LLM prompt delimiters were injected by package content"
+
+  LLM_ANALYSIS_FAILED:
+    source: python
+    analyzer: llm
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
+    knobs:
+      enabled: true
+    description: "LLM analysis failed and the scan completed with deterministic analyzers only"
+
+  META_CONTEXT_BUDGET_EXCEEDED:
+    source: python
+    analyzer: meta
+    category: policy_violation
+    taxonomy: not_applicable
+    severity: INFO
+    knobs:
+      enabled: true
+    description: "Content was excluded from meta analysis by a configured context budget"
+
+  # Meta-discovered threats use category-specific identities so category and
+  # severity remain manifest-authoritative even though the evidence is model
+  # adjudicated. SAFE is not a missed threat and is intentionally excluded.
+  META_DETECTED_PROMPT_INJECTION:
+    source: python
+    analyzer: meta
+    category: prompt_injection
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported prompt-injection threat"
+
+  META_DETECTED_COMMAND_INJECTION:
+    source: python
+    analyzer: meta
+    category: command_injection
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported command-injection threat"
+
+  META_DETECTED_DATA_EXFILTRATION:
+    source: python
+    analyzer: meta
+    category: data_exfiltration
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported data-exfiltration threat"
+
+  META_DETECTED_UNAUTHORIZED_TOOL_USE:
+    source: python
+    analyzer: meta
+    category: unauthorized_tool_use
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported unauthorized tool use"
+
+  META_DETECTED_OBFUSCATION:
+    source: python
+    analyzer: meta
+    category: obfuscation
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported obfuscation threat"
+
+  META_DETECTED_HARDCODED_SECRETS:
+    source: python
+    analyzer: meta
+    category: hardcoded_secrets
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported hardcoded secrets"
+
+  META_DETECTED_SOCIAL_ENGINEERING:
+    source: python
+    analyzer: meta
+    category: social_engineering
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported social-engineering threat"
+
+  META_DETECTED_RESOURCE_ABUSE:
+    source: python
+    analyzer: meta
+    category: resource_abuse
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported resource abuse"
+
+  META_DETECTED_POLICY_VIOLATION:
+    source: python
+    analyzer: meta
+    category: policy_violation
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported policy violation"
+
+  META_DETECTED_MALWARE:
+    source: python
+    analyzer: meta
+    category: malware
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported malware threat"
+
+  META_DETECTED_HARMFUL_CONTENT:
+    source: python
+    analyzer: meta
+    category: harmful_content
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported harmful content"
+
+  META_DETECTED_SKILL_DISCOVERY_ABUSE:
+    source: python
+    analyzer: meta
+    category: skill_discovery_abuse
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported skill-discovery abuse"
+
+  META_DETECTED_TRANSITIVE_TRUST_ABUSE:
+    source: python
+    analyzer: meta
+    category: transitive_trust_abuse
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported transitive-trust abuse"
+
+  META_DETECTED_AUTONOMY_ABUSE:
+    source: python
+    analyzer: meta
+    category: autonomy_abuse
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported autonomy abuse"
+
+  META_DETECTED_TOOL_CHAINING_ABUSE:
+    source: python
+    analyzer: meta
+    category: tool_chaining_abuse
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported tool-chaining abuse"
+
+  META_DETECTED_UNICODE_STEGANOGRAPHY:
+    source: python
+    analyzer: meta
+    category: unicode_steganography
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected previously unreported Unicode steganography"
+
+  META_DETECTED_SUPPLY_CHAIN_ATTACK:
+    source: python
+    analyzer: meta
+    category: supply_chain_attack
+    taxonomy: per_finding
+    severity: CRITICAL
+    allowed_severity_demotions: [HIGH, MEDIUM, LOW, INFO]
+    knobs:
+      enabled: true
+    description: "Meta analysis detected a previously unreported supply-chain threat"
+
+  AIDEFENSE_BLOCKED:
+    source: python
+    analyzer: aidefense
+    category: prompt_injection
+    taxonomy: AITech-1.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "AI Defense blocked prompt content without a more specific classification"
+
+  AIDEFENSE_CODE_BLOCKED:
+    source: python
+    analyzer: aidefense
+    category: malware
+    taxonomy: AISubtech-12.2.1
+    severity: HIGH
+    knobs:
+      enabled: true
+    description: "AI Defense blocked code without a more specific classification"
+
+  VIRUSTOTAL_MALICIOUS_FILE:
+    source: python
+    analyzer: virustotal
+    category: malware
+    taxonomy: AISubtech-15.1.1
+    # Maximum base severity; the runtime detection ratio may emit MEDIUM or HIGH.
+    severity: CRITICAL
+    allowed_severity_demotions:
+      - HIGH
+      - MEDIUM
+    knobs:
+      enabled: true
+    description: "VirusTotal engines identify a packaged file as malicious"

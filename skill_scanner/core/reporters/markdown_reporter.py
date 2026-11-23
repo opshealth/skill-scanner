@@ -100,6 +100,8 @@ class MarkdownReporter:
         lines.append(f"- **Medium:** {len(result.get_findings_by_severity(Severity.MEDIUM))}")
         lines.append(f"- **Low:** {len(result.get_findings_by_severity(Severity.LOW))}")
         lines.append(f"- **Info:** {len(result.get_findings_by_severity(Severity.INFO))}")
+        if result.suppressed_findings:
+            lines.append(f"- **Suppressed by policy:** {len(result.suppressed_findings)}")
         lines.append("")
 
         # Findings
@@ -164,6 +166,9 @@ class MarkdownReporter:
         lines.append(f"- **Medium:** {report.medium_count}")
         lines.append(f"- **Low:** {report.low_count}")
         lines.append(f"- **Info:** {report.info_count}")
+        total_suppressed = sum(len(r.suppressed_findings) for r in report.scan_results)
+        if total_suppressed:
+            lines.append(f"- **Suppressed by policy:** {total_suppressed}")
         lines.append("")
 
         # Individual skill results
@@ -177,6 +182,8 @@ class MarkdownReporter:
             lines.append("")
             lines.append(f"- **Max Severity:** {result.max_severity.value}")
             lines.append(f"- **Findings:** {len(result.findings)}")
+            if result.suppressed_findings:
+                lines.append(f"- **Suppressed by policy:** {len(result.suppressed_findings)}")
             lines.append(f"- **Directory:** {result.skill_directory}")
             lines.append("")
 
@@ -324,12 +331,33 @@ class MarkdownReporter:
             if finding.snippet:
                 lines.append(f"{indent_str}")
                 lines.append(f"{indent_str}**Code Snippet:**")
-                if not re.search(r"```", finding.snippet):
-                    lines.append(f"{indent_str}```")
-                for line in finding.snippet.splitlines():
+                snippet_lines = finding.snippet.splitlines()
+                open_fence: str | None = None
+                has_fence = False
+                for line in snippet_lines:
+                    formatted_line = f"{indent_str}{line}"
+                    if open_fence:
+                        closing = rf" {{0,3}}{re.escape(open_fence[0])}{{{len(open_fence)},}}[ \t]*"
+                        if re.fullmatch(closing, formatted_line):
+                            open_fence = None
+                    else:
+                        opening = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", formatted_line)
+                        if opening and (opening[1][0] == "~" or "`" not in opening[2]):
+                            open_fence = opening[1]
+                            has_fence = True
+
+                # Preserve fences that remain complete after report indentation,
+                # but contain other snippets so they cannot consume the report.
+                preformatted = has_fence and open_fence is None
+                fence = ""
+                if not preformatted:
+                    longest_run = max((len(run) for run in re.findall(r"`+", finding.snippet)), default=0)
+                    fence = "`" * max(3, longest_run + 1)
+                    lines.append(f"{indent_str}{fence}")
+                for line in snippet_lines:
                     lines.append(f"{indent_str}{line}")
-                if not re.search(r"```", finding.snippet):
-                    lines.append(f"{indent_str}```")
+                if not preformatted:
+                    lines.append(f"{indent_str}{fence}")
 
             if finding.remediation:
                 lines.append(f"{indent_str}")

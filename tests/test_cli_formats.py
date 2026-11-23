@@ -21,11 +21,14 @@ Ensures all --format options produce valid, parseable output.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from skill_scanner.core.scan_policy import ScanPolicy
 
 
 @pytest.fixture
@@ -51,8 +54,22 @@ def run_cli(args: list[str], timeout: int = 60) -> tuple[str, str, int]:
         text=True,
         timeout=timeout,
         cwd=Path(__file__).parent.parent,
+        env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"},
     )
     return result.stdout, result.stderr, result.returncode
+
+
+def filter_runtime_stderr(stderr: str) -> str:
+    """Remove noisy native runtime warnings that are unrelated to CLI status output."""
+    ignored_markers = (
+        "RuntimeWarning",
+        "onnxruntime",
+        "device_discovery.cc",
+        "skipping pci_bus_id",
+    )
+    return "\n".join(
+        line for line in stderr.splitlines() if not any(marker.lower() in line.lower() for marker in ignored_markers)
+    )
 
 
 # =============================================================================
@@ -128,6 +145,25 @@ class TestJSONFormat:
         data = json.loads(stdout)
         assert "skill_name" in data
 
+    def test_oversized_manifest_is_a_json_block_verdict_not_a_cli_error(self, tmp_path: Path):
+        skill = tmp_path / "oversized"
+        skill.mkdir()
+        (skill / "SKILL.md").write_bytes(b"x" * 129)
+        policy = ScanPolicy.default()
+        policy.file_limits.max_loader_file_size_bytes = 128
+        policy_path = tmp_path / "policy.yaml"
+        policy.to_yaml(policy_path)
+
+        stdout, stderr, code = run_cli(["scan", str(skill), "--policy", str(policy_path), "--format", "json"])
+
+        assert code == 0, stderr
+        data = json.loads(stdout)
+        assert data["is_safe"] is False
+        assert data["max_severity"] == "HIGH"
+        assert [finding["rule_id"] for finding in data["findings"]] == ["SKILL_LOAD_REJECTED_LIMIT"]
+        assert data["scan_metadata"]["loader"]["content_scanned"] is False
+        assert data["scan_metadata"]["cel"]["evaluated"] == 0
+
     def test_json_format_with_behavioral(self, safe_skill_dir):
         """Test JSON format with behavioral analyzer enabled."""
         stdout, stderr, code = run_cli(["scan", str(safe_skill_dir), "--format", "json", "--use-behavioral"])
@@ -137,8 +173,8 @@ class TestJSONFormat:
         data = json.loads(stdout)
         assert "skill_name" in data
 
-        # Check stderr has status message (ignore Python runtime warnings)
-        stderr_filtered = "\n".join(line for line in stderr.splitlines() if "RuntimeWarning" not in line)
+        # Check stderr has status message (ignore Python/native runtime warnings)
+        stderr_filtered = filter_runtime_stderr(stderr)
         assert "behavioral" in stderr_filtered.lower() or stderr_filtered.strip() == ""
 
 
@@ -269,6 +305,16 @@ class TestSARIFFormat:
 
         assert "driver" in tool
         assert "name" in tool["driver"]
+
+    def test_sarif_tool_version_matches_package_version(self, safe_skill_dir):
+        """The SARIF driver version must report the installed package version, not a fixed default."""
+        from skill_scanner import __version__
+
+        stdout, _, code = run_cli(["scan", str(safe_skill_dir), "--format", "sarif"])
+        assert code == 0
+
+        driver = json.loads(stdout)["runs"][0]["tool"]["driver"]
+        assert driver["version"] == __version__
 
 
 # =============================================================================
@@ -419,3 +465,55 @@ class TestAnalyzerStatusInJSON:
         # JSON should be clean
         data = json.loads(stdout)
         assert "skill_name" in data
+
+
+# =============================================================================
+# Scoped Suppression Tests
+# =============================================================================
+class TestScopedSuppressions:
+    @staticmethod
+    def _policy(tmp_path: Path) -> Path:
+        policy_file = tmp_path / "scoped.yaml"
+        policy_file.write_text(
+            "suppressions:\n"
+            "  - rule_id: DATA_EXFIL_HTTP_POST\n"
+            '    skills: ["data-exfiltrator"]\n'
+            '    reason: "Reviewed in ticket-1234"\n'
+            "  - rule_id: COMMAND_INJECTION_EVAL\n"
+            '    skills: ["data-exfiltrator"]\n'
+            '    reason: "Reviewed in ticket-1234"\n',
+            encoding="utf-8",
+        )
+        return policy_file
+
+    def test_suppressed_critical_does_not_fail_the_build(self, test_skills_dir, tmp_path):
+        skill = test_skills_dir / "malicious" / "exfiltrator"
+        args = ["scan", str(skill), "--format", "json", "--fail-on-severity", "critical"]
+
+        _, _, baseline_code = run_cli(args)
+        assert baseline_code == 1, "the fixture must trip the CRITICAL gate without a policy"
+
+        stdout, _, code = run_cli([*args, "--policy", str(self._policy(tmp_path))])
+        assert code == 0
+
+        data = json.loads(stdout)
+        assert all(f["rule_id"] != "DATA_EXFIL_HTTP_POST" for f in data["findings"])
+        assert "DATA_EXFIL_HTTP_POST" in {f["rule_id"] for f in data["suppressed_findings"]}
+        assert data["scan_metadata"]["suppressions"]["suppressed"] == 2
+
+    def test_json_stays_clean_with_suppressions(self, test_skills_dir, tmp_path):
+        skill = test_skills_dir / "malicious" / "exfiltrator"
+        stdout, _, _ = run_cli(
+            ["scan", str(skill), "--format", "json", "--policy", str(self._policy(tmp_path))],
+        )
+        assert json.loads(stdout)["skill_name"] == "data-exfiltrator"
+
+    def test_sarif_reports_the_suppression(self, test_skills_dir, tmp_path):
+        skill = test_skills_dir / "malicious" / "exfiltrator"
+        stdout, _, _ = run_cli(
+            ["scan", str(skill), "--format", "sarif", "--policy", str(self._policy(tmp_path))],
+        )
+        results = json.loads(stdout)["runs"][0]["results"]
+        suppressed = [r for r in results if "suppressions" in r]
+        assert {r["ruleId"] for r in suppressed} == {"DATA_EXFIL_HTTP_POST", "COMMAND_INJECTION_EVAL"}
+        assert suppressed[0]["suppressions"][0]["justification"] == "Reviewed in ticket-1234"

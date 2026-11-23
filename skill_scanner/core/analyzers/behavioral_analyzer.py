@@ -45,9 +45,23 @@ from ...core.static_analysis.context_extractor import (
 )
 from ...core.static_analysis.interprocedural.call_graph_analyzer import CallGraphAnalyzer
 from ...core.static_analysis.interprocedural.cross_file_analyzer import CrossFileAnalyzer, CrossFileCorrelation
+from ...threats.threats import get_threat_codes
 from .base import BaseAnalyzer
 
 logger = logging.getLogger(__name__)
+
+# BEHAVIOR_ALIGNMENT_* and BEHAVIOR_CROSSFILE_* rule IDs are built from the
+# threat name, so these findings pick their Cisco AI taxonomy code here rather
+# than from the pack manifest.  The codes come from
+# ThreatMapping.BEHAVIORAL_THREATS; only these names get one.
+ALIGNMENT_TAXONOMY: dict[str, str] = get_threat_codes(
+    "behavioral",
+    ("DATA EXFILTRATION", "CREDENTIAL THEFT", "COMMAND INJECTION", "HIDDEN FUNCTIONALITY", "ALIGNMENT_MISMATCH"),
+)
+CROSSFILE_TAXONOMY: dict[str, str] = get_threat_codes(
+    "behavioral",
+    ("exfiltration_chain", "credential_network_separation", "env_var_exfiltration"),
+)
 
 
 def _run_coroutine_sync(coro):
@@ -79,14 +93,18 @@ class BehavioralAnalyzer(BaseAnalyzer):
         use_alignment_verification: bool = False,
         llm_model: str | None = None,
         llm_api_key: str | None = None,
+        llm_provider: str | None = None,
+        llm_reasoning_effort: str | None = None,
     ):
         """
         Initialize behavioral analyzer.
 
         Args:
             use_alignment_verification: Enable LLM-powered alignment verification
-            llm_model: LLM model for alignment verification (e.g., "gemini/gemini-2.0-flash")
+            llm_model: LLM model for alignment verification (e.g., "gemini/gemini-3.8-flash")
             llm_api_key: API key for the LLM provider (or resolved from environment)
+            llm_provider: Optional provider override used for request semantics
+            llm_reasoning_effort: Optional reasoning-depth control for alignment calls
 
         Note:
             This analyzer processes Python (.py) files with full AST-based dataflow
@@ -103,16 +121,40 @@ class BehavioralAnalyzer(BaseAnalyzer):
         self.alignment_orchestrator = None
         if use_alignment_verification:
             try:
+                from .apple_fm import is_apple_fm_model
                 from .behavioral.alignment import AlignmentOrchestrator
 
                 # Resolve LLM configuration - use SKILL_SCANNER_LLM_* variables
-                model = llm_model or os.environ.get("SKILL_SCANNER_LLM_MODEL", "gemini/gemini-2.0-flash")
+                model = llm_model or os.environ.get("SKILL_SCANNER_LLM_MODEL", "gemini/gemini-3.8-flash")
                 api_key = llm_api_key or os.environ.get("SKILL_SCANNER_LLM_API_KEY")
+                provider_name = (
+                    (llm_provider or os.environ.get("SKILL_SCANNER_LLM_PROVIDER") or "")
+                    .strip()
+                    .lower()
+                    .replace("_", "-")
+                )
+                # A hosted gateway wins over the model name, matching the
+                # adjudicator and meta analyzer. openai-compatible plus
+                # apple-fm/system is a remote model, not the on-device one.
+                hosted_provider = provider_name in {
+                    "openai",
+                    "openai-compatible",
+                    "custom-openai",
+                }
 
-                if api_key:
+                if not hosted_provider and (is_apple_fm_model(model) or provider_name == "apple-fm"):
+                    # Alignment prompts carry whole source files and exceed the
+                    # on-device model's context window.
+                    logger.warning(
+                        "Alignment verification needs a hosted model; the on-device Apple Foundation "
+                        "Model's context window is too small. Skipping alignment verification."
+                    )
+                elif api_key:
                     self.alignment_orchestrator = AlignmentOrchestrator(
                         llm_model=model,
                         llm_api_key=api_key,
+                        llm_provider=llm_provider,
+                        llm_reasoning_effort=llm_reasoning_effort,
                     )
                     logger.info("Alignment verification enabled with %s", model)
                 else:
@@ -313,6 +355,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 remediation=f"Review function {func_context.name} and ensure documentation matches implementation",
                 analyzer="behavioral",
                 metadata={
+                    "aisubtech": ALIGNMENT_TAXONOMY.get(threat_name),
                     "function_name": func_context.name,
                     "threat_name": threat_name,
                     "confidence": analysis.get("confidence"),
@@ -329,6 +372,29 @@ class BehavioralAnalyzer(BaseAnalyzer):
     def _generate_findings_from_context(self, context: SkillScriptContext, skill: Skill) -> list[Finding]:
         """Generate security findings from extracted context."""
         findings = []
+
+        # Surface truncated dataflow coverage so an early-stopped (budgeted) analysis
+        # is not silently reported as clean. The dataflow result is a sound
+        # under-approximation, so absence of a flow finding is not proof of safety.
+        if context.dataflow_incomplete:
+            findings.append(
+                Finding(
+                    id=self._generate_id("DATAFLOW_ANALYSIS_INCOMPLETE", context.file_path),
+                    rule_id="BEHAVIOR_DATAFLOW_ANALYSIS_INCOMPLETE",
+                    category=ThreatCategory.POLICY_VIOLATION,
+                    severity=Severity.INFO,
+                    title="Behavioral dataflow analysis incomplete (analysis budget exceeded)",
+                    description=(
+                        f"Static dataflow analysis for {context.file_path} stopped early after "
+                        "hitting its time/iteration budget. Reported flows are sound but may be "
+                        "incomplete; the absence of a flow finding does not guarantee safety."
+                    ),
+                    file_path=context.file_path,
+                    remediation="Consider splitting very large or deeply-nested functions into smaller units.",
+                    analyzer="behavioral",
+                    metadata={"dataflow_incomplete": True},
+                )
+            )
 
         # Check for exfiltration patterns
         if context.has_network and context.has_env_var_access:
@@ -367,8 +433,10 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 )
             )
 
-        # Check for environment variable harvesting (even without immediate network)
-        if context.has_env_var_access:
+        # Reserve "harvesting" for bulk environment collection. Targeted
+        # lookups such as os.environ.get("ANTHROPIC_API_KEY") remain available
+        # to the exfiltration correlation above, but are not bulk harvesting.
+        if context.has_env_var_harvesting:
             findings.append(
                 Finding(
                     id=self._generate_id("ENV_VAR_HARVESTING", context.file_path),
@@ -462,6 +530,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 remediation=f"Review data flow across files: {', '.join(correlation.files_involved)}",
                 analyzer="behavioral",
                 metadata={
+                    "aisubtech": CROSSFILE_TAXONOMY.get(correlation.threat_type),
                     "files_involved": correlation.files_involved,
                     "threat_type": correlation.threat_type,
                     "evidence": correlation.evidence,
@@ -639,7 +708,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 Finding(
                     id=self._generate_id("BASH_TAINT", f"{file_path}:{flow.source_line}:{flow.sink_line}"),
                     rule_id="BEHAVIOR_BASH_TAINT_FLOW",
-                    category=category,
+                    category=ThreatCategory.DATA_EXFILTRATION,
                     severity=severity,
                     title=title,
                     description=desc,
@@ -656,6 +725,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         "source_line": flow.source_line,
                         "sink_command": flow.sink_command,
                         "taints": [t.name for t in flow.taints],
+                        "behavior_category": category.value,
                     },
                 )
             )

@@ -18,18 +18,76 @@
 Skill package loader and SKILL.md parser.
 """
 
+import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import frontmatter
 
-from ..utils.file_utils import get_file_type
+from ..utils.file_utils import (
+    FileValidationError,
+    get_file_type,
+    read_text_strict,
+    resolve_path_within_root,
+)
+from ..utils.markdown import extract_markdown_links
 from .exceptions import SkillLoadError
+from .file_magic import detect_magic
 from .models import Skill, SkillFile, SkillManifest
 
 logger = logging.getLogger(__name__)
+
+_FRONTMATTER_QUOTE_RE = re.compile(r'^(description|name):[^\S\n]+(?!["\'])(.*:.*)$', re.MULTILINE)
+
+_SCRIPT_MAGIC_TYPES = {
+    "code/javascript": "javascript",
+    "code/jsx": "javascript",
+    "code/python": "python",
+    "code/shell": "bash",
+    "code/tsx": "typescript",
+    "code/typescript": "typescript",
+}
+_SCRIPT_MAGIC_MIN_CONFIDENCE = 0.85
+
+
+def _quote_frontmatter_scalar(match: re.Match[str]) -> str:
+    """Quote a YAML scalar while preserving literal backslashes and quotes."""
+    return f"{match.group(1)}: {json.dumps(match.group(2), ensure_ascii=False)}"
+
+
+def frontmatter_parse_input(content: str) -> str:
+    """Return SKILL.md text exactly as it is handed to the frontmatter parser.
+
+    ``name`` and ``description`` values that contain ``:`` are quoted first so YAML
+    does not read them as mappings. The static analyzer composes the same text, so
+    the frontmatter values it scans are the ones the manifest gets.
+    """
+    if "---" in content:
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            fm = _FRONTMATTER_QUOTE_RE.sub(_quote_frontmatter_scalar, parts[1])
+            return f"---{fm}---{parts[2]}"
+    return content
+
+
+def _classify_extensionless_script(path: Path, file_type: str) -> str:
+    """Recognize extensionless source code so analyzers do not skip it.
+
+    Extension-based classification remains authoritative when a suffix exists.
+    For extensionless files, only high-confidence Magika labels that map to a
+    script type supported by :class:`Skill` are accepted.
+    """
+    if file_type != "other" or path.suffix:
+        return file_type
+
+    magic = detect_magic(path)
+    if magic is None or magic.score < _SCRIPT_MAGIC_MIN_CONFIDENCE:
+        return file_type
+    return _SCRIPT_MAGIC_TYPES.get(magic.content_type, file_type)
 
 
 class SkillLoader:
@@ -56,14 +114,27 @@ class SkillLoader:
         else:
             self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
 
-    def load_skill(self, skill_directory: str | Path, *, lenient: bool = False) -> Skill:
+    def load_skill(
+        self,
+        skill_directory: str | Path,
+        *,
+        lenient: bool = False,
+        skill_file: str | None = None,
+    ) -> Skill:
         """
         Load a skill package from a directory.
 
         Args:
             skill_directory: Path to the skill directory
-            lenient: When True, tolerate missing/malformed fields and return
-                a best-effort Skill instead of raising ``SkillLoadError``.
+            lenient: When True, tolerate missing/malformed YAML frontmatter and
+                fill default manifest fields instead of raising ``SkillLoadError``.
+                Files must still be valid UTF-8 text without NUL bytes; binary
+                or invalid encoding always fails. When ``SKILL.md`` is absent and
+                *lenient* is True, the loader falls back to scanning ``.md`` files
+                in the directory (supports non-Codex/Cursor formats such as
+                Claude Code ``.claude/commands/*.md``).
+            skill_file: Optional custom metadata filename to use instead of
+                ``SKILL.md`` (e.g. ``"README.md"``).
 
         Returns:
             Parsed Skill object
@@ -71,39 +142,182 @@ class SkillLoader:
         Raises:
             SkillLoadError: If skill cannot be loaded (strict mode only)
         """
-        if not isinstance(skill_directory, Path):
-            skill_directory = Path(skill_directory)
+        raw_directory = os.fspath(skill_directory)
+        if "\x00" in raw_directory:
+            raise SkillLoadError("Skill directory path contains a null byte")
+        try:
+            normalized_directory = os.path.realpath(os.path.expanduser(raw_directory))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SkillLoadError(f"Invalid skill directory: {raw_directory}") from exc
+        skill_directory = Path(normalized_directory)
 
         if not skill_directory.exists():
-            raise SkillLoadError(f"Skill directory does not exist: {skill_directory}")
-
+            raise SkillLoadError(f"Skill directory does not exist: {raw_directory}")
         if not skill_directory.is_dir():
-            raise SkillLoadError(f"Path is not a directory: {skill_directory}")
+            raise SkillLoadError(f"Path is not a directory: {normalized_directory}")
 
-        # Find SKILL.md
-        skill_md_path = skill_directory / "SKILL.md"
-        if not skill_md_path.exists():
+        # Find the skill metadata file
+        if skill_file:
+            metadata_name = Path(skill_file)
+            if (
+                metadata_name.is_absolute()
+                or metadata_name.name != skill_file
+                or "/" in skill_file
+                or "\\" in skill_file
+                or "\x00" in skill_file
+            ):
+                raise SkillLoadError("skill_file must be a filename contained in the skill directory")
+            metadata_candidate = skill_directory / metadata_name
+        else:
+            metadata_candidate = skill_directory / "SKILL.md"
+
+        try:
+            resolved_skill_md_path = resolve_path_within_root(
+                metadata_candidate,
+                root=skill_directory,
+                must_exist=False,
+            )
+        except FileValidationError as exc:
+            raise SkillLoadError(f"Skill metadata file is outside the skill directory: {metadata_candidate}") from exc
+        skill_md_path: Path | None
+        synthetic_instruction_body = False
+        if not resolved_skill_md_path.exists():
+            if skill_file:
+                raise SkillLoadError(f"{skill_file} not found in {skill_directory}")
+            if not lenient:
+                raise SkillLoadError(f"SKILL.md not found in {skill_directory}")
+            skill_md_path = None
+        else:
+            skill_md_path = resolved_skill_md_path
+
+        if skill_md_path is not None:
+            # Standard path: parse the metadata file
+            manifest, instruction_body, instruction_body_line_offset = self._parse_skill_md(
+                skill_md_path,
+                lenient=lenient,
+                package_root=skill_directory,
+            )
+        elif lenient:
+            # Lenient fallback: no SKILL.md, synthesize from .md files in the directory
+            synthetic_instruction_body = True
+            (
+                skill_md_path,
+                manifest,
+                instruction_body,
+                instruction_body_line_offset,
+            ) = self._synthesize_from_md_files(skill_directory)
+        else:  # pragma: no cover - strict absence is handled while resolving
             raise SkillLoadError(f"SKILL.md not found in {skill_directory}")
 
-        # Parse SKILL.md
-        manifest, instruction_body = self._parse_skill_md(skill_md_path, lenient=lenient)
-
         # Discover all files in the skill package
-        files = self._discover_files(skill_directory)
+        skipped_symlinks: list[dict[str, Any]] = []
+        files = self._discover_files(skill_directory, skipped_symlinks)
 
         # Extract referenced files from instruction body
         referenced_files = self._extract_referenced_files(instruction_body)
 
+        load_metadata = (
+            {
+                "synthetic_instruction_body": True,
+                "synthetic_instruction_source_count": sum(file.file_type == "markdown" for file in files),
+            }
+            if synthetic_instruction_body
+            else {}
+        )
+        if skipped_symlinks:
+            load_metadata["skipped_symlinks"] = skipped_symlinks
         return Skill(
             directory=skill_directory,
             manifest=manifest,
             skill_md_path=skill_md_path,
             instruction_body=instruction_body,
+            instruction_body_line_offset=instruction_body_line_offset,
             files=files,
             referenced_files=referenced_files,
+            load_metadata=load_metadata,
         )
 
-    def _parse_skill_md(self, skill_md_path: Path, *, lenient: bool = False) -> tuple[SkillManifest, str]:
+    def _synthesize_from_md_files(
+        self,
+        skill_directory: Path,
+    ) -> tuple[Path, SkillManifest, str, int]:
+        """Synthesize a Skill from ``.md`` files when ``SKILL.md`` is absent.
+
+        Scans the directory for markdown files, concatenates their content as the
+        instruction body, and builds a best-effort manifest from the directory name.
+
+        Returns:
+            Tuple of (primary_md_path, SkillManifest, instruction_body)
+
+        Raises:
+            SkillLoadError: If no ``.md`` files are found in the directory.
+        """
+        md_files: list[Path] = []
+        try:
+            candidates = skill_directory.iterdir()
+            for candidate in candidates:
+                if candidate.is_symlink() or candidate.suffix.lower() != ".md" or not candidate.is_file():
+                    continue
+                md_files.append(resolve_path_within_root(candidate, root=skill_directory))
+        except (FileValidationError, OSError) as exc:
+            raise SkillLoadError(f"Failed to enumerate markdown files in {skill_directory}: {exc}") from exc
+        md_files.sort()
+        if not md_files:
+            raise SkillLoadError(
+                f"No SKILL.md and no .md files found in {skill_directory} "
+                f"(lenient mode requires at least one markdown file)"
+            )
+
+        logger.warning(
+            "SKILL.md not found in %s; falling back to %d .md file(s) (lenient mode)",
+            skill_directory,
+            len(md_files),
+        )
+
+        # Use the first .md file as the primary path
+        primary_md = md_files[0]
+
+        manifest, body, body_line_offset = self._parse_skill_md(
+            primary_md,
+            lenient=True,
+            package_root=skill_directory,
+        )
+
+        # Append content from remaining .md files
+        extra_bodies: list[str] = []
+        for md_file in md_files[1:]:
+            extra_bodies.append(self._read_skill_text_file(md_file, package_root=skill_directory))
+        if extra_bodies:
+            body = body + "\n\n" + "\n\n".join(extra_bodies)
+            # A concatenation of multiple physical files has no single source
+            # line mapping. Keep it body-relative until a source-map model is
+            # introduced rather than publishing misleading physical lines.
+            body_line_offset = 0
+
+        return primary_md, manifest, body, body_line_offset
+
+    def _read_skill_text_file(self, path: Path, *, package_root: Path) -> str:
+        """Read a skill metadata or markdown file as strict UTF-8 text.
+
+        Delegates to :func:`~skill_scanner.utils.file_utils.read_text_strict`
+        and converts failures to :class:`SkillLoadError`.
+        """
+        try:
+            return read_text_strict(
+                path,
+                max_size_bytes=self.max_file_size_bytes,
+                root=package_root,
+            )
+        except FileValidationError as e:
+            raise SkillLoadError(str(e)) from e
+
+    def _parse_skill_md(
+        self,
+        skill_md_path: Path,
+        *,
+        lenient: bool = False,
+        package_root: Path,
+    ) -> tuple[SkillManifest, str, int]:
         """
         Parse SKILL.md file with YAML frontmatter.
 
@@ -113,16 +327,14 @@ class SkillLoader:
                 raising ``SkillLoadError``.
 
         Returns:
-            Tuple of (SkillManifest, instruction_body)
+            Tuple of (SkillManifest, instruction_body, body line offset)
 
         Raises:
             SkillLoadError: If parsing fails (strict mode only)
         """
-        try:
-            with open(skill_md_path, encoding="utf-8") as f:
-                content = f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            raise SkillLoadError(f"Failed to read SKILL.md: {e}")
+        content = self._read_skill_text_file(skill_md_path, package_root=package_root)
+        raw_content = content
+        content = frontmatter_parse_input(content)
 
         # Parse with python-frontmatter
         try:
@@ -136,6 +348,17 @@ class SkillLoader:
                 body = content
             else:
                 raise SkillLoadError(f"Failed to parse YAML frontmatter: {e}")
+
+        # python-frontmatter strips outer whitespace from ``post.content``.
+        # Recover where that exact terminal body begins in the physical source
+        # without reparsing frontmatter or changing the normalized body.
+        trimmed_source = raw_content.rstrip()
+        if body and trimmed_source.endswith(body):
+            body_start = len(trimmed_source) - len(body)
+            body_line_offset = raw_content.count("\n", 0, body_start)
+        else:
+            # Lenient/malformed inputs can lack a reliable one-file mapping.
+            body_line_offset = 0
 
         # Validate required fields (lenient: fill defaults)
         if "name" not in metadata:
@@ -200,9 +423,34 @@ class SkillLoader:
             disable_model_invocation=bool(disable_model_invocation),
         )
 
-        return manifest, body
+        return manifest, body, body_line_offset
 
-    def _discover_files(self, skill_directory: Path) -> list[SkillFile]:
+    def _record_skipped_symlink(self, path: Path, skill_root: Path, sink: list[dict[str, Any]]) -> None:
+        """Remember a symlink that discovery refused to follow."""
+        try:
+            target = os.readlink(path)
+        except OSError:
+            target = ""
+        try:
+            inside = path.resolve().is_relative_to(skill_root.resolve())
+        except (OSError, RuntimeError, ValueError):
+            inside = False
+        try:
+            kind = "directory" if path.is_dir() else "file" if path.exists() else "dangling"
+        except OSError:
+            kind = "unknown"
+        sink.append(
+            {
+                "path": path.relative_to(skill_root).as_posix(),
+                "target": target,
+                "kind": kind,
+                "escapes_skill_root": not inside,
+            }
+        )
+
+    def _discover_files(
+        self, skill_directory: Path, skipped_symlinks: list[dict[str, Any]] | None = None
+    ) -> list[SkillFile]:
         """
         Discover all files in the skill package.
 
@@ -213,18 +461,21 @@ class SkillLoader:
             List of SkillFile objects
         """
         files = []
-        skill_root = skill_directory.resolve()
+        skill_root = skill_directory
 
         for path in skill_directory.rglob("*"):
+            if path.is_symlink():
+                # Symlinks are never followed (the target could be anything), but
+                # they must not vanish silently: record them so the scanner can
+                # report each one.
+                if skipped_symlinks is not None:
+                    self._record_skipped_symlink(path, skill_root, skipped_symlinks)
+                continue
             if not path.is_file():
                 continue
-            if path.is_symlink():
-                continue
             try:
-                resolved = path.resolve()
-                if not resolved.is_relative_to(skill_root):
-                    continue
-            except (OSError, ValueError):
+                resolved = resolve_path_within_root(path, root=skill_root)
+            except (FileValidationError, OSError, ValueError):
                 continue
 
             # Skip .git/ directory only (version control metadata, not an attack vector).
@@ -234,25 +485,30 @@ class SkillLoader:
             # Important: Skills may live under hidden parent directories like `.claude/skills/`.
             # We only want to skip .git *inside* the skill package, not its parents.
             rel_parts = path.relative_to(skill_directory).parts
-            if any(part == ".git" for part in rel_parts):
+            if ".git" in rel_parts[:-1]:
                 continue
 
-            relative_path = str(path.relative_to(skill_directory))
-            file_type = get_file_type(path)
-            size_bytes = path.stat().st_size
+            relative_path = str(resolved.relative_to(skill_root))
+            file_type = get_file_type(resolved)
+            size_bytes = resolved.stat().st_size
+            if size_bytes <= self.max_file_size_bytes:
+                file_type = _classify_extensionless_script(resolved, file_type)
 
             # Read content if not too large and not binary
             content = None
-            if size_bytes < self.max_file_size_bytes and file_type != "binary":
+            if size_bytes <= self.max_file_size_bytes and file_type != "binary":
                 try:
-                    with open(path, encoding="utf-8") as f:
-                        content = f.read()
-                except (OSError, UnicodeDecodeError):
+                    content = read_text_strict(
+                        resolved,
+                        max_size_bytes=self.max_file_size_bytes,
+                        root=skill_root,
+                    )
+                except (FileValidationError, OSError, UnicodeDecodeError):
                     # Treat as binary if can't read as text
                     file_type = "binary"
 
             skill_file = SkillFile(
-                path=path,
+                path=resolved,
                 relative_path=relative_path,
                 file_type=file_type,
                 content=content,
@@ -261,6 +517,43 @@ class SkillLoader:
             files.append(skill_file)
 
         return files
+
+    def _local_py_module_names_from_import_lines(self, text: str) -> list[str]:
+        """Return top-level module names in *text* that look like real Python imports.
+
+        Avoids matching English prose such as "read from the file" or "import the module"
+        (which previously produced a bogus ``the.py`` reference).
+        """
+        names: list[str] = []
+
+        # ``from x[.y] import …`` and ``from .x import …``
+        for m in re.finditer(
+            r"from\s+(\.?[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\s+import\b",
+            text,
+        ):
+            mod_path = m.group(1)
+            if mod_path.startswith("."):
+                rest = mod_path.lstrip(".")
+                top = rest.split(".")[0] if rest else ""
+            else:
+                top = mod_path.split(".")[0]
+            if top:
+                names.append(top)
+
+        # ``import x`` / ``import x, y`` — only at line start (optional indent / markdown list marker)
+        for m in re.finditer(r"(?m)^[ \t]*(?:[-*+][ \t]+)?import[ \t]+([^\\\n#;]+)", text):
+            tail = m.group(1).strip()
+            tail = tail.split("#")[0].strip()
+            for part in tail.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                part = re.split(r"\s+as\s+", part, maxsplit=1)[0].strip()
+                mod = part.split(".")[0].strip()
+                if mod and re.fullmatch(r"[A-Za-z0-9_]+", mod):
+                    names.append(mod)
+
+        return names
 
     def _extract_referenced_files(self, instruction_body: str) -> list[str]:
         """
@@ -278,11 +571,12 @@ class SkillLoader:
         references = []
 
         # Match markdown links: [text](file.md)
-        markdown_links = re.findall(r"\[([^\]]+)\]\(([^\)]+)\)", instruction_body)
+        markdown_links = extract_markdown_links(instruction_body)
         for _, link in markdown_links:
             # Filter out URLs, keep relative file paths
             if not link.startswith(("http://", "https://", "ftp://", "#")):
-                references.append(link)
+                if ".." not in link and not link.startswith("/"):
+                    references.append(link)
 
         # Match "see FILE.md" or "refer to FILE.md" patterns
         # Use backticks or quotes to identify actual file references, avoiding false matches like "the.py"
@@ -311,9 +605,11 @@ class SkillLoader:
         )
         references.extend(include_patterns)
 
-        # Match file paths in code blocks that look like references
-        code_file_refs = re.findall(r"(?:from|import)\s+([A-Za-z0-9_]+)\s", instruction_body)
-        stdlib_names = getattr(sys, "stdlib_module_names", set())
+        # Infer local *.py names from Python import syntax (strict — not bare "from|import" tokens).
+        # A loose pattern like ``from (\w+)`` matches English ("from the documentation") and
+        # yields false positives such as ``the.py``.
+        code_file_refs = self._local_py_module_names_from_import_lines(instruction_body)
+        stdlib_names: set[str] = set(getattr(sys, "stdlib_module_names", set()))
         KNOWN_THIRD_PARTY = {
             "requests",
             "numpy",
@@ -347,8 +643,8 @@ class SkillLoader:
             references.append(f"assets/{pattern}")
             references.append(f"templates/{pattern}")
 
-        # Return unique references
-        return list(set(references))
+        # Filter out any references with path traversal sequences
+        return list({r for r in references if ".." not in r and not r.startswith("/")})
 
     def extract_references_from_file(self, file_path: Path, content: str) -> list[str]:
         """
@@ -373,7 +669,7 @@ class SkillLoader:
             import_patterns = re.findall(r"^from\s+([A-Za-z0-9_.]+)\s+import", content, re.MULTILINE)
             relative_imports = re.findall(r"^from\s+\.([A-Za-z0-9_.]*)\s+import", content, re.MULTILINE)
 
-            stdlib_names = getattr(sys, "stdlib_module_names", set())
+            stdlib_names: set[str] = set(getattr(sys, "stdlib_module_names", set()))
             _known_3p = {
                 "requests",
                 "numpy",
@@ -410,7 +706,8 @@ class SkillLoader:
             source_patterns = re.findall(r"(?:source|\.)\s+([A-Za-z0-9_\-./]+\.(?:sh|bash))", content)
             references.extend(source_patterns)
 
-        return list(set(references))
+        # Filter out any references with path traversal sequences
+        return list({r for r in references if ".." not in r and not r.startswith("/")})
 
 
 def load_skill(

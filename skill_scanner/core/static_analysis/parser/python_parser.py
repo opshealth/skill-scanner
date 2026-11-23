@@ -56,7 +56,7 @@ class PythonParser:
     NETWORK_MODULES = ["requests", "urllib", "http", "socket", "aiohttp"]
     FILE_OPERATIONS = ["open", "read", "write", "Path", "os.remove", "shutil"]
     SUBPROCESS_PATTERNS = ["subprocess", "os.system", "os.popen"]
-    DANGEROUS_FUNCTIONS = ["eval", "exec", "compile", "__import__"]
+    DANGEROUS_FUNCTIONS = {"eval", "exec", "compile", "__import__"}
 
     # Agent tool indicators - map code patterns to agent tools
     TOOL_INDICATORS = {
@@ -124,14 +124,16 @@ class PythonParser:
         },
     }
 
-    def __init__(self, source_code: str):
+    def __init__(self, source_code: str, file_path: str | None = None):
         """
         Initialize parser with source code.
 
         Args:
             source_code: Python source code to parse
+            file_path: Optional path to the source file (used in error messages)
         """
         self.source_code = source_code
+        self.file_path = file_path
         self.tree: ast.Module | None = None
         self.functions: list[FunctionInfo] = []
         self.imports: list[str] = []
@@ -154,7 +156,16 @@ class PythonParser:
             self._extract_global_code()
             return True
         except SyntaxError as e:
-            logger.warning("Syntax error in source: %s", e)
+            location = self.file_path or e.filename or "<unknown>"
+            line_no = e.lineno or "?"
+            bad_text = (e.text or "").rstrip()
+            logger.warning(
+                "Syntax error in %s at line %s: %s%s",
+                location,
+                line_no,
+                e.msg,
+                f" — {bad_text!r}" if bad_text else "",
+            )
             return False
 
     def _extract_module_level_strings(self) -> None:
@@ -257,7 +268,7 @@ class PythonParser:
                         func_info.has_file_operations = True
                     if any(sub in call_name for sub in self.SUBPROCESS_PATTERNS):
                         func_info.has_subprocess = True
-                    if any(danger in call_name for danger in self.DANGEROUS_FUNCTIONS):
+                    if self._is_dangerous_builtin_call(call_name):
                         func_info.has_eval_exec = True
 
             # Extract string literals
@@ -281,6 +292,21 @@ class PythonParser:
                 return f"{node.func.value.id}.{node.func.attr}"
             return node.func.attr
         return None
+
+    @classmethod
+    def _is_dangerous_builtin_call(cls, call_name: str) -> bool:
+        """Return whether *call_name* names a dangerous Python builtin.
+
+        Attribute names such as ``exec_module`` and ``re.compile`` are not the
+        builtins ``exec`` and ``compile``.  Matching exact names avoids
+        conflating those common APIs with dynamic code evaluation while still
+        recognizing an explicit ``builtins.eval(...)`` spelling.
+        """
+        if call_name in cls.DANGEROUS_FUNCTIONS:
+            return True
+        if call_name.startswith("builtins."):
+            return call_name.removeprefix("builtins.") in cls.DANGEROUS_FUNCTIONS
+        return False
 
     def _extract_global_code(self) -> None:
         """Extract code executed at module level (not in functions)."""

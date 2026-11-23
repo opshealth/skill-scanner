@@ -31,8 +31,11 @@ import logging
 import os
 from pathlib import Path
 
+from ..llm_reasoning import ReasoningConfigurationError
+from ..llm_token_options import resolve_llm_max_tokens
 from .analyzers.base import BaseAnalyzer
 from .analyzers.bytecode_analyzer import BytecodeAnalyzer
+from .analyzers.correlation_analyzer import CorrelationAnalyzer
 from .analyzers.pipeline_analyzer import PipelineAnalyzer
 from .analyzers.static import StaticAnalyzer
 from .scan_policy import ScanPolicy
@@ -40,12 +43,29 @@ from .scan_policy import ScanPolicy
 logger = logging.getLogger(__name__)
 
 
+class AnalyzerConfigurationError(ValueError):
+    """An explicitly requested analyzer could not be built.
+
+    Raised instead of logging a warning so that a requested LLM, behavioral or
+    meta analysis never turns into a successful deterministic-only scan.
+    """
+
+
+LLM_CONFIGURATION_HINT = (
+    "Set SKILL_SCANNER_LLM_MODEL and SKILL_SCANNER_LLM_API_KEY (or cloud credentials for "
+    "Bedrock and Vertex), and install the provider extra if it needs one, for example "
+    "pip install 'cisco-ai-skill-scanner[bedrock]'."
+)
+
+
 def build_core_analyzers(
     policy: ScanPolicy,
     *,
     custom_yara_rules_path: str | Path | None = None,
+    extra_rules_dirs: list[Path] | None = None,
+    trusted_pack_dirs: list[Path] | None = None,
 ) -> list[BaseAnalyzer]:
-    """Build the three core analyzers, respecting ``policy.analyzers`` toggles.
+    """Build core analyzers, respecting ``policy.analyzers`` toggles.
 
     This is the **single source of truth** for which core analyzers exist
     and how they are configured.  ``SkillScanner.__init__``, the CLI, the
@@ -55,6 +75,10 @@ def build_core_analyzers(
         policy: The active scan policy.
         custom_yara_rules_path: Optional path to a directory of custom YARA
             rule files (``.yara``).  Forwarded to :class:`StaticAnalyzer`.
+        extra_rules_dirs: Additional signature rule directories from
+            community/external packs (e.g. ATR).
+        trusted_pack_dirs: Administrator-approved v2 rule pack directories.
+            Forwarded to :class:`StaticAnalyzer`.
 
     Returns:
         A list of core analyzer instances with *policy* attached.
@@ -62,11 +86,20 @@ def build_core_analyzers(
     analyzers: list[BaseAnalyzer] = []
 
     if policy.analyzers.static:
-        analyzers.append(StaticAnalyzer(custom_yara_rules_path=custom_yara_rules_path, policy=policy))
+        analyzers.append(
+            StaticAnalyzer(
+                custom_yara_rules_path=custom_yara_rules_path,
+                policy=policy,
+                extra_rules_dirs=extra_rules_dirs,
+                trusted_pack_dirs=trusted_pack_dirs,
+            )
+        )
     if policy.analyzers.bytecode:
         analyzers.append(BytecodeAnalyzer(policy=policy))
     if policy.analyzers.pipeline:
         analyzers.append(PipelineAnalyzer(policy=policy))
+    if getattr(policy.analyzers, "correlation", False):
+        analyzers.append(CorrelationAnalyzer(policy=policy))
 
     return analyzers
 
@@ -75,6 +108,8 @@ def build_analyzers(
     policy: ScanPolicy,
     *,
     custom_yara_rules_path: str | Path | None = None,
+    extra_rules_dirs: list[Path] | None = None,
+    trusted_pack_dirs: list[Path] | None = None,
     use_behavioral: bool = False,
     use_llm: bool = False,
     llm_model: str | None = None,
@@ -82,6 +117,7 @@ def build_analyzers(
     llm_base_url: str | None = None,
     llm_api_version: str | None = None,
     llm_provider: str | None = None,
+    llm_user: str | None = None,
     use_virustotal: bool = False,
     vt_api_key: str | None = None,
     vt_upload_files: bool = False,
@@ -89,8 +125,13 @@ def build_analyzers(
     aidefense_api_key: str | None = None,
     aidefense_api_url: str | None = None,
     use_trigger: bool = False,
+    use_osv: bool = False,
     llm_consensus_runs: int = 1,
     llm_max_tokens: int | None = None,
+    llm_reasoning_effort: str | None = None,
+    llm_decompose: bool = False,
+    system_one_endpoint: str | None = None,
+    system_one_model: str | None = None,
 ) -> list[BaseAnalyzer]:
     """Build the full analyzer list (core + optional).
 
@@ -102,15 +143,39 @@ def build_analyzers(
     construction logic.
 
     Args:
+        extra_rules_dirs: Additional signature rule directories from
+            community/external packs (e.g. ATR).
+        trusted_pack_dirs: Administrator-approved v2 rule pack directories.
+            Forwarded to the core :class:`StaticAnalyzer`.
         llm_max_tokens: Override the default ``max_tokens`` for the
-            :class:`LLMAnalyzer`.  When *None* the analyzer's own
-            default (8192) is used.
+            :class:`LLMAnalyzer`. When *None*,
+            ``SKILL_SCANNER_LLM_MAX_TOKENS`` takes precedence over the
+            policy's ``llm_analysis.max_output_tokens`` value.
+        llm_user: Optional raw Chat Completions user field for
+            OpenAI-compatible LLM routes.
+        llm_reasoning_effort: Optional reasoning-depth control. When *None*,
+            LLM clients resolve ``SKILL_SCANNER_LLM_REASONING_EFFORT`` and
+            otherwise preserve provider defaults.
+        llm_decompose: Run the LLM analyzer once per focus and union the
+            findings instead of one general pass. Off by default because it
+            multiplies model calls by the number of focuses.
+        system_one_endpoint: Optional System One screening endpoint. Advisory
+            only: the tier records a calibrated probability and never changes a
+            finding, a severity or the verdict.
+        system_one_model: Model name for the System One endpoint. Required
+            whenever *system_one_endpoint* is set, and rejected without it,
+            because neither half is usable alone.
 
     Returns:
         A list of analyzer instances ready to be passed to
         :class:`SkillScanner`.
     """
-    analyzers = build_core_analyzers(policy, custom_yara_rules_path=custom_yara_rules_path)
+    analyzers = build_core_analyzers(
+        policy,
+        custom_yara_rules_path=custom_yara_rules_path,
+        extra_rules_dirs=extra_rules_dirs,
+        trusted_pack_dirs=trusted_pack_dirs,
+    )
 
     # -- Optional analyzers (flag-driven) -----------------------------------
 
@@ -118,35 +183,54 @@ def build_analyzers(
         try:
             from .analyzers.behavioral_analyzer import BehavioralAnalyzer
 
-            analyzers.append(BehavioralAnalyzer())
+            analyzers.append(
+                BehavioralAnalyzer(
+                    llm_provider=llm_provider,
+                    llm_reasoning_effort=llm_reasoning_effort,
+                )
+            )
         except (ImportError, ValueError, TypeError) as exc:
-            logger.warning("Could not load behavioral analyzer: %s", exc)
+            raise AnalyzerConfigurationError(f"the behavioral analyzer could not be loaded: {exc}") from exc
 
     if use_llm:
+        effective_max_tokens = resolve_llm_max_tokens(
+            llm_max_tokens,
+            default=policy.llm_analysis.max_output_tokens,
+        )
         try:
             from .analyzers.llm_analyzer import LLMAnalyzer
 
-            model = llm_model or os.getenv("SKILL_SCANNER_LLM_MODEL") or "claude-3-5-sonnet-20241022"
+            env_model = os.getenv("SKILL_SCANNER_LLM_MODEL")
+            model = llm_model or env_model
             key = llm_api_key or os.getenv("SKILL_SCANNER_LLM_API_KEY")
             base_url = llm_base_url or os.getenv("SKILL_SCANNER_LLM_BASE_URL")
             api_version = llm_api_version or os.getenv("SKILL_SCANNER_LLM_API_VERSION")
+            provider = llm_provider or os.getenv("SKILL_SCANNER_LLM_PROVIDER")
             extra_kwargs: dict = {}
-            effective_max_tokens = (
-                llm_max_tokens if llm_max_tokens is not None else policy.llm_analysis.max_output_tokens
+            extra_kwargs["max_tokens"] = effective_max_tokens
+            llm = LLMAnalyzer(
+                model=model,
+                api_key=key,
+                base_url=base_url,
+                api_version=api_version,
+                provider=provider,
+                llm_user=llm_user,
+                reasoning_effort=llm_reasoning_effort,
+                policy=policy,
+                decompose=llm_decompose,
+                **extra_kwargs,
             )
-            if effective_max_tokens is not None:
-                extra_kwargs["max_tokens"] = effective_max_tokens
-            if llm_provider and not llm_model and not os.getenv("SKILL_SCANNER_LLM_MODEL"):
-                llm = LLMAnalyzer(provider=llm_provider, policy=policy, **extra_kwargs)
-            else:
-                llm = LLMAnalyzer(
-                    model=model, api_key=key, base_url=base_url, api_version=api_version, policy=policy, **extra_kwargs
-                )
             if llm_consensus_runs > 1:
                 llm.consensus_runs = llm_consensus_runs
             analyzers.append(llm)
+        except ReasoningConfigurationError:
+            # A requested LLM control must never turn ``--use-llm`` into a
+            # successful deterministic-only scan.
+            raise
         except (ImportError, ValueError, TypeError) as exc:
-            logger.warning("Could not load LLM analyzer: %s", exc)
+            raise AnalyzerConfigurationError(
+                f"the LLM analyzer could not be loaded: {exc}. {LLM_CONFIGURATION_HINT}"
+            ) from exc
 
     if use_virustotal:
         try:
@@ -180,5 +264,33 @@ def build_analyzers(
             analyzers.append(TriggerAnalyzer())
         except (ImportError, ValueError, TypeError) as exc:
             logger.warning("Could not load Trigger analyzer: %s", exc)
+
+    if system_one_model and not system_one_endpoint:
+        # Neither half is usable alone. Accepting the model and quietly building no
+        # screening tier would let a typo in the endpoint flag read as a successful run
+        # with screening enabled.
+        raise ValueError("system_one_endpoint is required when system_one_model is set")
+
+    if system_one_endpoint:
+        if not system_one_model:
+            raise ValueError("system_one_model is required when system_one_endpoint is set")
+        from .analyzers.system_one_analyzer import SystemOneAnalyzer
+
+        analyzers.append(
+            SystemOneAnalyzer(
+                system_one_endpoint,
+                model=system_one_model,
+                api_key=os.getenv("SKILL_SCANNER_SYSTEM_ONE_API_KEY"),
+                policy=policy,
+            )
+        )
+
+    if use_osv:
+        try:
+            from .analyzers.osv_analyzer import OSVAnalyzer
+
+            analyzers.append(OSVAnalyzer(enabled=True, policy=policy))
+        except (ImportError, ValueError, TypeError) as exc:
+            logger.warning("Could not load OSV analyzer: %s", exc)
 
     return analyzers

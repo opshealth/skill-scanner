@@ -180,13 +180,109 @@ class TestLenientLoader:
         skill = loader.load_skill(tmp_path / "dict-name")
         assert isinstance(skill.name, str)
 
+    def test_colon_in_description_value(self, tmp_path):
+        """Description values containing ': ' should not crash the YAML parser."""
+        _write_skill_md(
+            tmp_path / "colon-desc",
+            """\
+            ---
+            name: colon-skill
+            description: This does X: more text here
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-desc")
+        assert skill.name == "colon-skill"
+        assert "more text" in skill.description
+
+    def test_colon_in_name_value(self, tmp_path):
+        """Name values containing ': ' should not crash the YAML parser."""
+        _write_skill_md(
+            tmp_path / "colon-name",
+            """\
+            ---
+            name: evil: skill
+            description: test
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-name")
+        assert "evil" in skill.name
+
+    def test_colon_with_embedded_quotes(self, tmp_path):
+        """Value with both ': ' and embedded double quotes should round-trip."""
+        _write_skill_md(
+            tmp_path / "colon-quote",
+            """\
+            ---
+            name: test
+            description: He said "hello": then left
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-quote")
+        assert "hello" in skill.description
+        assert "then left" in skill.description
+
+    def test_colon_value_with_backslashes(self, tmp_path):
+        """Auto-quoted values must preserve literal backslashes."""
+        _write_skill_md(
+            tmp_path / "colon-backslash",
+            """\
+            ---
+            name: test
+            description: Windows path C:\\temp\\data: keep backslashes
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-backslash")
+        assert "C:\\temp\\data" in skill.description
+        assert "keep backslashes" in skill.description
+
     def test_no_skill_md_still_raises_in_lenient(self, tmp_path):
-        """Even in lenient mode, a missing SKILL.md is fatal."""
+        """Even in lenient mode, a completely empty dir (no .md files) is fatal."""
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
         loader = SkillLoader()
-        with pytest.raises(SkillLoadError, match="SKILL.md not found"):
+        with pytest.raises(SkillLoadError, match="No SKILL.md and no .md files found"):
             loader.load_skill(empty_dir, lenient=True)
+
+    def test_invalid_utf8_skill_md_strict_raises(self, tmp_path):
+        skill_dir = tmp_path / "bad-enc"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_bytes(b"\xff\xfe\xfd")
+
+        loader = SkillLoader()
+        with pytest.raises(SkillLoadError, match="not valid UTF-8"):
+            loader.load_skill(skill_dir)
+
+    def test_invalid_utf8_skill_md_lenient_raises(self, tmp_path):
+        skill_dir = tmp_path / "bad-enc"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_bytes(b"\xff\xfe\xfd")
+
+        loader = SkillLoader()
+        with pytest.raises(SkillLoadError, match="not valid UTF-8"):
+            loader.load_skill(skill_dir, lenient=True)
+
+    def test_null_byte_in_skill_md_raises(self, tmp_path):
+        skill_dir = tmp_path / "nul-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_bytes(
+            b"---\nname: x\ndescription: y\n---\nbody\x00tail",
+        )
+
+        loader = SkillLoader()
+        with pytest.raises(SkillLoadError, match="null bytes"):
+            loader.load_skill(skill_dir, lenient=True)
 
 
 # ============================================================================
@@ -270,7 +366,7 @@ class TestMultiSkillSummary:
 
 
 class TestScanDirectorySkipped:
-    def test_malformed_skill_tracked_in_skipped(self, tmp_path):
+    def test_malformed_skill_scanned_with_bounded_inert_fallback(self, tmp_path):
         good_dir = tmp_path / "good-skill"
         _write_skill_md(
             good_dir,
@@ -295,9 +391,13 @@ class TestScanDirectorySkipped:
         scanner = SkillScanner()
         report = scanner.scan_directory(tmp_path)
 
-        assert report.total_skills_scanned == 1
-        assert len(report.skills_skipped) == 1
-        assert "bad-skill" in report.skills_skipped[0]["skill"]
+        assert report.total_skills_scanned == 2
+        assert report.skills_skipped == []
+        bad_result = next(result for result in report.scan_results if result.skill_name == "bad-skill")
+        assert bad_result.scan_metadata is not None
+        assert bad_result.scan_metadata["loader"]["fallback_used"] is True
+        assert bad_result.scan_metadata["loader"]["strict_error_code"] == "MISSING_REQUIRED_MANIFEST_FIELD"
+        assert "SKILL_LOAD_FALLBACK_USED" in {finding.rule_id for finding in bad_result.findings}
 
     def test_malformed_skill_loaded_in_lenient(self, tmp_path):
         good_dir = tmp_path / "good-skill"
@@ -341,10 +441,10 @@ class TestPrecommitGetAffectedSkills:
     def test_detects_skill_under_configured_path(self):
         from skill_scanner.hooks.pre_commit import get_affected_skills
 
-        # Path.exists is patched so no real filesystem setup is needed;
+        # Path.is_file is patched so no real filesystem setup is needed;
         # this avoids sandbox restrictions on creating ".cursor" directories.
         staged = [".cursor/skills/my-skill/scripts/run.py"]
-        with patch("pathlib.Path.exists", return_value=True):
+        with patch("pathlib.Path.is_file", return_value=True):
             result = get_affected_skills(staged, ".cursor/skills")
         assert len(result) >= 1
 

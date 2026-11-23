@@ -22,7 +22,10 @@ https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html
 """
 
 import json
+import os
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote_from_bytes, urlsplit
 
 from ...core.models import Finding, Report, ScanResult, Severity
 
@@ -73,8 +76,9 @@ class SARIFReporter:
 
     def _generate_from_scan_result(self, result: ScanResult) -> dict[str, Any]:
         """Generate SARIF from a single ScanResult."""
-        rules = self._extract_rules(result.findings)
-        results = self._convert_findings(result.findings)
+        findings = [*result.findings, *result.suppressed_findings]
+        rules = self._extract_rules(findings)
+        results = self._convert_findings(findings, result.skill_directory)
 
         return {
             "$schema": self.SARIF_SCHEMA,
@@ -98,6 +102,7 @@ class SARIFReporter:
         all_findings = []
         for scan_result in report.scan_results:
             all_findings.extend(scan_result.findings)
+            all_findings.extend(scan_result.suppressed_findings)
         all_findings.extend(report.cross_skill_findings)
 
         rules = self._extract_rules(all_findings)
@@ -105,7 +110,10 @@ class SARIFReporter:
         # Create results with proper artifact locations
         all_results = []
         for scan_result in report.scan_results:
-            results = self._convert_findings(scan_result.findings)
+            results = self._convert_findings(
+                [*scan_result.findings, *scan_result.suppressed_findings],
+                scan_result.skill_directory,
+            )
             all_results.extend(results)
         all_results.extend(self._convert_findings(report.cross_skill_findings))
 
@@ -176,7 +184,39 @@ class SARIFReporter:
 
         return rules
 
-    def _convert_findings(self, findings: list[Finding]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _artifact_uri(finding: Finding, skill_directory: str | None) -> str:
+        """Build the artifact URI for a finding, relative to the scan root.
+
+        Finding.file_path is relative to the skill's own directory. GitHub Code
+        Scanning resolves URIs against %SRCROOT% (the repository root), so when
+        skills are discovered in subdirectories the skill path must be included
+        for results to be tied to files in a PR. The scanner's working directory
+        is taken as the scan root; when the skill directory lies outside it
+        (or on a different drive), the skill-relative path is kept as before.
+        """
+        file_path = Path(finding.file_path or "SKILL.md")
+        if file_path.is_absolute():
+            return file_path.as_uri()
+
+        if skill_directory:
+            try:
+                skill_rel = os.path.relpath(skill_directory, os.getcwd())
+            except ValueError:
+                # Windows: skill directory and CWD on different drives.
+                pass
+            else:
+                # Keep skill-relative paths when the skill is outside the
+                # scan root; a %SRCROOT%-relative path cannot be formed.
+                if skill_rel != os.pardir and not skill_rel.startswith(os.pardir + os.sep):
+                    file_path = Path(skill_rel) / file_path
+
+        # These are filesystem paths, so literal %, # and ? must not become
+        # URI escapes, fragments or queries. Keep only path separators safe.
+        # Preserve surrogate-escaped bytes from undecodable filenames as well.
+        return quote_from_bytes(os.fsencode(file_path.as_posix()), safe="/")
+
+    def _convert_findings(self, findings: list[Finding], skill_directory: str | None = None) -> list[dict[str, Any]]:
         """Convert findings to SARIF results."""
         results = []
 
@@ -191,16 +231,18 @@ class SARIFReporter:
                     "category": finding.category.value,
                     "severity": finding.severity.value,
                     **({"remediation": finding.remediation} if finding.remediation else {}),
+                    **self._taxonomy_properties(finding),
                 },
             }
 
-            artifact_uri = finding.file_path if finding.file_path else "SKILL.md"
+            artifact_uri = self._artifact_uri(finding, skill_directory)
+            artifact_location = {"uri": artifact_uri}
+            # SARIF 3.4.4 forbids a URI base for an absolute artifact URI.
+            if not urlsplit(artifact_uri).scheme:
+                artifact_location["uriBaseId"] = "%SRCROOT%"
             location: dict[str, Any] = {
                 "physicalLocation": {
-                    "artifactLocation": {
-                        "uri": artifact_uri,
-                        "uriBaseId": "%SRCROOT%",
-                    },
+                    "artifactLocation": artifact_location,
                 }
             }
 
@@ -220,9 +262,49 @@ class SARIFReporter:
                 "primaryLocationLineHash": finding.id,
             }
 
+            # A finding removed by a scoped policy suppression is reported as a
+            # suppressed SARIF result rather than omitted, so consumers such as
+            # GitHub Code Scanning show it as dismissed with its justification
+            # instead of silently losing it.
+            suppression = (finding.metadata or {}).get("suppression")
+            if isinstance(suppression, dict) and not suppression.get("severity"):
+                results.append(self._with_suppression(result, suppression))
+                continue
+
             results.append(result)
 
         return results
+
+    @staticmethod
+    def _taxonomy_properties(finding: Finding) -> dict[str, Any]:
+        """Carry the finding's Cisco AI taxonomy codes into SARIF result properties."""
+        metadata = finding.metadata or {}
+        if not metadata.get("aitech"):
+            return {}
+        properties: dict[str, Any] = {"aitech": metadata["aitech"]}
+        if metadata.get("aisubtech"):
+            properties["aisubtech"] = metadata["aisubtech"]
+        for key in ("framework_mappings", "aitech_mappings", "aisubtech_mappings"):
+            if metadata.get(key):
+                properties[key] = list(metadata[key])
+        return properties
+
+    @staticmethod
+    def _with_suppression(result: dict[str, Any], suppression: dict[str, Any]) -> dict[str, Any]:
+        """Attach a SARIF ``suppressions`` entry describing a policy suppression."""
+        justification = str(suppression.get("reason") or "").strip()
+        selector = suppression.get("matched_skill") or suppression.get("matched_path") or ""
+        if not justification:
+            justification = (
+                f"Suppressed by scan policy (selector: {selector})" if selector else "Suppressed by scan policy"
+            )
+        result["suppressions"] = [
+            {
+                "kind": "external",
+                "justification": justification,
+            }
+        ]
+        return result
 
     def save_report(self, data: ScanResult | Report, output_path: str):
         """

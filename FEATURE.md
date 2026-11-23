@@ -75,6 +75,7 @@ Post-processing includes:
 ### 3. Pipeline Analyzer
 
 - Parses shell command pipelines and classifies risk
+- Quote-aware pipe splitting (avoids false positives on `jq` expressions and other quoted `|` characters)
 - Detects fetch-and-execute and sensitive source-to-sink chains
 - Uses `command_safety`, `pipeline`, and `sensitive_files` policy knobs
 
@@ -137,6 +138,7 @@ Implemented in `skill_scanner/core/scan_policy.py` with built-ins in `skill_scan
 - `finding_output`
 - `severity_overrides`
 - `disabled_rules`
+- `suppressions`
 
 ### Policy capabilities
 
@@ -144,6 +146,8 @@ Implemented in `skill_scanner/core/scan_policy.py` with built-ins in `skill_scan
 - Deep-merge custom YAML overlays on defaults
 - Rule severity remapping without rule removal
 - Full rule disablement where required
+- Scoped suppression or downgrade of a rule for named skills or paths, with a
+  recorded reason, an optional expiry, and an audit trail in JSON and SARIF
 - Output-level dedupe and metadata controls
 
 ## CLI Features
@@ -165,6 +169,7 @@ Implemented in `skill_scanner/core/scan_policy.py` with built-ins in `skill_scan
 - VirusTotal/AI Defense keys: `--vt-api-key`, `--aidefense-api-key`, `--aidefense-api-url`
 - Output: `--format`, `--output`, `--detailed`, `--compact`, `--fail-on-findings`, `--fail-on-severity`
 - Multi-skill: `--recursive`, `--check-overlap`
+- Flexibility: `--lenient` (scan without `SKILL.md`), `--skill-file` (custom metadata filename)
 
 ## API Server Features
 

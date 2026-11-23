@@ -30,6 +30,7 @@ import logging
 from typing import Any
 
 from .....core.static_analysis.context_extractor import SkillFunctionContext
+from ...llm_request_handler import _TEMPERATURE_UNSET
 from .alignment_llm_client import AlignmentLLMClient
 from .alignment_prompt_builder import AlignmentPromptBuilder
 from .alignment_response_validator import AlignmentResponseValidator
@@ -51,22 +52,27 @@ class AlignmentOrchestrator:
 
     def __init__(
         self,
-        llm_model: str = "gemini/gemini-2.0-flash",
+        llm_model: str = "gemini/gemini-3.8-flash",
         llm_api_key: str | None = None,
         llm_base_url: str | None = None,
-        llm_temperature: float = 0.1,
+        llm_temperature: Any = _TEMPERATURE_UNSET,
         llm_max_tokens: int = 4096,
         llm_timeout: int = 120,
+        *,
+        llm_provider: str | None = None,
+        llm_reasoning_effort: str | None = None,
     ):
         """Initialize alignment orchestrator.
 
         Args:
-            llm_model: LLM model to use (e.g., "gemini/gemini-2.0-flash")
+            llm_model: LLM model to use (e.g., "gemini/gemini-3.8-flash")
             llm_api_key: API key for the LLM provider
             llm_base_url: Optional base URL for LLM API
             llm_temperature: Temperature for LLM responses
             llm_max_tokens: Max tokens for LLM responses
             llm_timeout: Timeout for LLM requests in seconds
+            llm_provider: Optional provider override used for request semantics
+            llm_reasoning_effort: Optional reasoning-depth control
 
         Raises:
             ValueError: If LLM API key is not provided
@@ -79,7 +85,9 @@ class AlignmentOrchestrator:
             model=llm_model,
             api_key=llm_api_key,
             base_url=llm_base_url,
+            provider=llm_provider,
             temperature=llm_temperature,
+            reasoning_effort=llm_reasoning_effort,
             max_tokens=llm_max_tokens,
             timeout=llm_timeout,
         )
@@ -88,6 +96,8 @@ class AlignmentOrchestrator:
             model=llm_model,
             api_key=llm_api_key,
             base_url=llm_base_url,
+            provider=llm_provider,
+            reasoning_effort=llm_reasoning_effort,
         )
 
         # Track analysis statistics

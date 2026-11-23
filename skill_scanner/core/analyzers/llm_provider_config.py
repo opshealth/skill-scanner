@@ -22,10 +22,82 @@ Handles detection and configuration of different LLM providers
 """
 
 import importlib.util
+import ipaddress
 import logging
 import os
+from importlib import import_module
+from typing import Protocol, cast
+from urllib.parse import urlsplit
+
+from .llm_request_options import (
+    normalize_litellm_model_for_provider,
+    resolve_llm_user,
+    supports_openai_user_param,
+)
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+
+# Bedrock "mantle" endpoint: an OpenAI-compatible route in front of Bedrock that
+# serves models absent from the bedrock-runtime catalogue (notably Gemma 4).
+# It is reached with SigV4 signing over service name "bedrock" rather than with a
+# bearer key, which is why it cannot go through LiteLLM's ``bedrock/`` adapter.
+BEDROCK_MANTLE_MODEL_PREFIX = "bedrock-mantle/"
+BEDROCK_MANTLE_PROVIDER = "bedrock-mantle"
+BEDROCK_MANTLE_SIGV4_SERVICE = "bedrock"
+BEDROCK_MANTLE_HOST_TEMPLATE = "https://bedrock-mantle.{region}.api.aws/openai/v1"
+
+
+def default_bedrock_mantle_base_url(region: str | None) -> str:
+    """Return the OpenAI-compatible mantle base URL for *region*."""
+
+    return BEDROCK_MANTLE_HOST_TEMPLATE.format(region=region or "us-east-1")
+
+
+def is_loopback_host(host: object) -> bool:
+    """Return whether *host* is the literal 127.0.0.1 or ::1 address."""
+
+    if isinstance(host, bytes):
+        host = host.decode("ascii", errors="strict")
+    if not isinstance(host, str):
+        return False
+    normalized = host.lower()
+    if "%" in normalized:
+        return False
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return address == ipaddress.ip_address("127.0.0.1") or address == ipaddress.ip_address("::1")
+
+
+def validate_ollama_base_url(base_url: str | None) -> None:
+    """Reject an Ollama endpoint that could route scanner content remotely."""
+
+    if base_url is None:
+        return
+    parsed = urlsplit(base_url)
+    if parsed.scheme != "http" or not is_loopback_host(parsed.hostname):
+        raise ValueError("Ollama base URL must be an http:// loopback endpoint")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Ollama base URL must not contain credentials, a query, or a fragment")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("Ollama base URL must not contain a path")
+
+
+def resolve_ollama_base_url(base_url: str | None) -> str:
+    """Return an explicit, validated endpoint for local Ollama requests.
+
+    LiteLLM also recognizes provider-specific environment variables such as
+    ``OLLAMA_API_BASE``.  Always supplying a scanner-owned endpoint prevents
+    those ambient values from redirecting skill content to a remote service.
+    """
+
+    effective_base_url = DEFAULT_OLLAMA_BASE_URL if base_url is None else base_url
+    validate_ollama_base_url(effective_base_url)
+    return effective_base_url
+
 
 # Check for Google GenAI availability
 # Wrap in try/except because find_spec can raise ModuleNotFoundError
@@ -41,14 +113,34 @@ try:
 except (ImportError, ModuleNotFoundError):
     LITELLM_AVAILABLE = False
 
-# Check for Azure Identity availability (optional -- pip install skill-scanner[azure])
-try:
-    from azure.identity import DefaultAzureCredential
 
-    AZURE_IDENTITY_AVAILABLE = True
+# Check for Azure Identity availability (optional -- pip install skill-scanner[azure])
+class _AzureAccessToken(Protocol):
+    """Minimal token shape used from the optional Azure dependency."""
+
+    token: str
+
+
+class _AzureCredential(Protocol):
+    """Minimal credential shape used from the optional Azure dependency."""
+
+    def get_token(self, *scopes: str) -> _AzureAccessToken: ...
+
+
+class _AzureCredentialFactory(Protocol):
+    """Constructor shape for ``azure.identity.DefaultAzureCredential``."""
+
+    def __call__(self) -> _AzureCredential: ...
+
+
+try:
+    _azure_identity = import_module("azure.identity")
+    _default_azure_credential = getattr(_azure_identity, "DefaultAzureCredential", None)
 except (ImportError, ModuleNotFoundError):
-    DefaultAzureCredential = None  # type: ignore[misc,assignment]
-    AZURE_IDENTITY_AVAILABLE = False
+    _default_azure_credential = None
+
+AZURE_IDENTITY_AVAILABLE = callable(_default_azure_credential)
+DefaultAzureCredential = cast(_AzureCredentialFactory, _default_azure_credential) if AZURE_IDENTITY_AVAILABLE else None
 
 
 class ProviderConfig:
@@ -60,9 +152,11 @@ class ProviderConfig:
         api_key: str | None = None,
         base_url: str | None = None,
         api_version: str | None = None,
+        provider: str | None = None,
         aws_region: str | None = None,
         aws_profile: str | None = None,
         aws_session_token: str | None = None,
+        llm_user: str | None = None,
     ):
         """
         Initialize provider configuration.
@@ -70,42 +164,113 @@ class ProviderConfig:
         Args:
             model: Model identifier
             api_key: API key (if None, reads from environment)
-            base_url: Custom base URL (for Azure)
-            api_version: API version (for Azure)
+            base_url: Custom base URL (for Azure/OpenAI-compatible endpoints)
+            api_version: API version (for Azure/OpenAI-compatible endpoints)
+            provider: Explicit provider override
             aws_region: AWS region (for Bedrock)
             aws_profile: AWS profile name (for Bedrock)
             aws_session_token: AWS session token (for Bedrock)
+            llm_user: Optional raw Chat Completions user field for OpenAI-compatible routes
         """
         self.model = model
         self.base_url = base_url
         self.api_version = api_version
+        self.provider = self._normalize_provider(provider or os.getenv("SKILL_SCANNER_LLM_PROVIDER"))
+        self.llm_user = resolve_llm_user(llm_user)
         self.aws_region = aws_region or os.getenv("AWS_REGION", "us-east-1")
         self.aws_profile = aws_profile or os.getenv("AWS_PROFILE")
         self.aws_session_token = aws_session_token or os.getenv("AWS_SESSION_TOKEN")
 
-        # Detect provider type from model string
+        self.is_openai_compatible = self.provider in {"openai", "openai-compatible", "custom-openai"}
+
+        # Detect provider type from model string unless an explicit OpenAI-compatible
+        # override is set. Custom model names can include provider words such as
+        # "gemini" without meaning they should use the Google SDK.
         model_lower = model.lower()
-        self.is_bedrock = "bedrock/" in model or model_lower.startswith("bedrock/")
-        self.is_gemini = "gemini" in model_lower or model_lower.startswith("gemini/")
-        self.is_azure = model_lower.startswith("azure/") or "azure" in model_lower
-        self.is_vertex = model_lower.startswith("vertex_ai/") or "vertex" in model_lower
-        self.is_ollama = model_lower.startswith("ollama/")
-        self.is_openrouter = model_lower.startswith("openrouter/")
+        # Detect the mantle route first so the plain Bedrock branch never claims it.
+        self.is_bedrock_mantle = self.provider == BEDROCK_MANTLE_PROVIDER or model_lower.startswith(
+            BEDROCK_MANTLE_MODEL_PREFIX
+        )
+        self.is_bedrock = (
+            not self.is_openai_compatible
+            and not self.is_bedrock_mantle
+            and ("bedrock/" in model or model_lower.startswith("bedrock/"))
+        )
+        self.is_gemini = not self.is_openai_compatible and (
+            "gemini" in model_lower or model_lower.startswith("gemini/")
+        )
+        self.is_azure = not self.is_openai_compatible and (model_lower.startswith("azure/") or "azure" in model_lower)
+        self.is_vertex = not self.is_openai_compatible and (
+            model_lower.startswith("vertex_ai/") or "vertex" in model_lower
+        )
+        self.is_ollama = not self.is_openai_compatible and model_lower.startswith("ollama/")
+        self.is_apple_fm = not self.is_openai_compatible and (
+            self.provider == "apple-fm" or model_lower.startswith("apple-fm/")
+        )
+        # Mantle is dispatched before Apple FM. A mixed selection would send
+        # skill content to the remote SigV4 endpoint while the caller asked
+        # for the on-device model.
+        if self.is_apple_fm and self.is_bedrock_mantle:
+            raise ValueError(
+                "Apple Foundation Models run on-device and cannot be combined with a "
+                "Bedrock Mantle model. Use provider 'apple-fm' with an apple-fm/ model, "
+                "or a bedrock-mantle model without the apple-fm provider."
+            )
+        self.is_openrouter = not self.is_openai_compatible and model_lower.startswith("openrouter/")
+        self.is_orcarouter = self.provider == "orcarouter" or (
+            not self.is_openai_compatible and model_lower.startswith("orcarouter/")
+        )
+        self.is_gpt5 = "gpt-5" in model_lower
+
+        if self.is_ollama:
+            self.base_url = resolve_ollama_base_url(self.base_url)
 
         # Determine if we should use Google SDK
         self.use_google_sdk = False
+        # Determine if we should use the direct SigV4 Bedrock mantle client.
+        self.use_bedrock_mantle = False
 
         # Handle Vertex AI separately (uses LiteLLM, not Google SDK)
-        if self.is_vertex:
+        if self.is_bedrock_mantle:
+            # Direct SigV4 client; LiteLLM is deliberately not involved because it
+            # cannot sign a body it builds itself.
+            self.use_bedrock_mantle = True
+            self.model = self._normalize_bedrock_mantle_model_name(model)
+            if not self.base_url:
+                self.base_url = default_bedrock_mantle_base_url(self.aws_region)
+        elif self.is_openai_compatible:
+            if not LITELLM_AVAILABLE:
+                raise ImportError(
+                    "LiteLLM is required for OpenAI-compatible providers. Install with: pip install litellm"
+                )
+            self.model = self._normalize_openai_compatible_model_name(model)
+        elif self.is_vertex:
             # Vertex AI models stay as-is for LiteLLM
             if not LITELLM_AVAILABLE:
                 raise ImportError("LiteLLM is required for Vertex AI. Install with: pip install litellm")
             self.model = model  # Keep vertex_ai/ prefix for LiteLLM
+        elif self.is_orcarouter:
+            # OrcaRouter is OpenAI-compatible; route through the OpenAI LiteLLM adapter
+            # with the well-known default endpoint (overridable via base_url).
+            if not LITELLM_AVAILABLE:
+                raise ImportError("LiteLLM is required for OrcaRouter. Install with: pip install litellm")
+            self.model = self._normalize_orcarouter_model_name(model)
+        elif self.is_apple_fm:
+            # On-device Foundation Models. Keep the apple-fm/ prefix so the
+            # request handler can dispatch without LiteLLM or an API key.
+            self.model = model if model_lower.startswith("apple-fm/") else f"apple-fm/{model or 'system'}"
         elif self.is_gemini and GOOGLE_GENAI_AVAILABLE:
             # Google AI Studio (uses Google SDK directly)
             self.use_google_sdk = True
             self.model = self._normalize_gemini_model_name(model)
-        elif self.is_gemini and not GOOGLE_GENAI_AVAILABLE:
+        elif self.is_gemini and LITELLM_AVAILABLE:
+            # Google AI Studio through LiteLLM when google-genai is not installed.
+            if not model.startswith("gemini/"):
+                model_name = model.replace("gemini-", "").replace("gemini/", "")
+                self.model = f"gemini/{model_name}"
+            else:
+                self.model = model
+        elif self.is_gemini:
             raise ImportError(
                 "For Gemini models, either LiteLLM or google-genai is required. "
                 "Install with: pip install litellm or pip install google-genai"
@@ -113,12 +278,7 @@ class ProviderConfig:
         elif not LITELLM_AVAILABLE:
             raise ImportError("LiteLLM is required for enhanced LLM analyzer. Install with: pip install litellm")
         else:
-            # Normalize Gemini model name for LiteLLM (Google AI Studio via LiteLLM)
-            if self.is_gemini and not model.startswith("gemini/"):
-                model_name = model.replace("gemini-", "").replace("gemini/", "")
-                self.model = f"gemini/{model_name}"
-            else:
-                self.model = model
+            self.model = model
 
         # Resolve API key (may acquire Entra ID token for Azure)
         self._using_entra_id = False
@@ -126,14 +286,50 @@ class ProviderConfig:
 
         # Note: Google SDK client is created per-request, not configured globally
 
+    def _normalize_provider(self, provider: str | None) -> str | None:
+        """Normalize provider aliases used by env vars, CLI, and SDK callers."""
+        if provider is None:
+            return None
+
+        normalized = provider.strip().lower().replace("_", "-")
+        if normalized in {"custom-openai", "openai-compatible"}:
+            return normalized
+        return normalized
+
+    def _normalize_openai_compatible_model_name(self, model: str) -> str:
+        """Force LiteLLM's OpenAI adapter for arbitrary OpenAI-compatible model names."""
+        return normalize_litellm_model_for_provider(model, "openai-compatible")
+
+    def _normalize_orcarouter_model_name(self, model: str) -> str:
+        """Force LiteLLM's OpenAI adapter for OrcaRouter models (OpenAI-compatible)."""
+        if model.lower().startswith("orcarouter/"):
+            model = model[len("orcarouter/") :]
+        if model.lower().startswith("openai/"):
+            return model
+        return f"openai/{model}"
+
+    def _normalize_bedrock_mantle_model_name(self, model: str) -> str:
+        """Strip the routing prefix, leaving the bare mantle model id."""
+        if model.lower().startswith(BEDROCK_MANTLE_MODEL_PREFIX):
+            model = model[len(BEDROCK_MANTLE_MODEL_PREFIX) :]
+        if not model:
+            raise ValueError("Bedrock mantle model id must not be empty")
+        return model
+
     def _resolve_api_key(self, api_key: str | None) -> str | None:
         """Resolve API key from parameter or environment variables.
 
         Uses SKILL_SCANNER_LLM_API_KEY consistently for all providers.
 
         Special cases:
-        - Vertex AI: Uses GOOGLE_APPLICATION_CREDENTIALS (service account)
+        - Vertex AI: Always returns ``None`` -- LiteLLM/google-auth read
+          GOOGLE_APPLICATION_CREDENTIALS directly from the environment when
+          set, or fall back to ambient Application Default Credentials
+          (like Bedrock's IAM role) -- e.g. a GCE/Cloud Run attached
+          service account or Workload Identity, with no key file on disk
+          at all.
         - Ollama: No API key needed (local)
+        - Apple Foundation Models: No API key needed (on-device)
         - Azure: Falls back to Entra ID (``az login``) when no API key is set
         """
         if api_key is not None:
@@ -141,8 +337,13 @@ class ProviderConfig:
 
         # Special cases with different auth mechanisms
         if self.is_vertex:
-            return os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            return None
         elif self.is_ollama:
+            return None
+        elif self.is_apple_fm:
+            return None
+        elif self.is_bedrock_mantle:
+            # SigV4 signing uses ambient AWS credentials, not an API key.
             return None
 
         # Check the standard env var first
@@ -228,7 +429,14 @@ class ProviderConfig:
 
     def validate(self) -> None:
         """Validate that configuration is complete."""
-        if not self.is_bedrock and not self.is_ollama and not self.api_key:
+        if (
+            not self.is_bedrock
+            and not self.is_bedrock_mantle
+            and not self.is_ollama
+            and not self.is_vertex
+            and not self.is_apple_fm
+            and not self.api_key
+        ):
             if self.is_azure:
                 raise ValueError(
                     f"No API key or Entra ID credentials found for Azure model {self.model}. "
@@ -255,8 +463,21 @@ class ProviderConfig:
 
         if self.base_url:
             params["api_base"] = self.base_url
+        elif self.is_orcarouter:
+            # Default OrcaRouter endpoint (OpenAI-compatible) when no base_url is given.
+            params["api_base"] = "https://api.orcarouter.ai/v1"
         if self.api_version:
             params["api_version"] = self.api_version
+
+        if self.is_ollama:
+            # Scanner prompts require a structured final answer.  Reasoning
+            # models served by Ollama may otherwise spend the whole output
+            # budget in the hidden thinking channel and return empty content.
+            # LiteLLM maps ``reasoning_effort=none`` to Ollama ``think=false``.
+            params["reasoning_effort"] = "none"
+
+        if self.llm_user and supports_openai_user_param(self.model, self.provider):
+            params["user"] = self.llm_user
 
         if self.is_bedrock:
             # AWS Bedrock supports:

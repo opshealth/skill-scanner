@@ -41,6 +41,7 @@ previously-hardcoded sets/lists.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,9 +49,27 @@ from typing import Any  # used in _from_dict / _deep_merge signatures
 
 import yaml
 
+from ..utils.file_utils import FileValidationError, read_text_strict
+from .cel.models import CelMode
+from .suppressions import SuppressionRule, suppression_from_dict
+
 logger = logging.getLogger(__name__)
 
 _MAX_PATTERN_LENGTH = 1000
+_MAX_POLICY_SIZE_BYTES = 1024 * 1024
+
+
+def _drop_null_values(value: Any) -> Any:
+    """Remove null mapping keys recursively.
+
+    PyYAML parses a valueless key as ``None``. Treating it as absent lets policy
+    defaults apply without discarding other falsy values.
+    """
+    if isinstance(value, dict):
+        return {k: _drop_null_values(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_null_values(v) for v in value]
+    return value
 
 
 def _safe_compile(pattern: str, flags: int = 0, *, max_length: int = _MAX_PATTERN_LENGTH) -> re.Pattern | None:
@@ -75,6 +94,10 @@ _PRESET_POLICIES: dict[str, Path] = {
     "strict": _DATA_DIR / "strict_policy.yaml",
     "balanced": _DEFAULT_POLICY_PATH,
     "permissive": _DATA_DIR / "permissive_policy.yaml",
+    # Balanced detection with the noisiest rules reported at LOW; chosen on real-skill
+    # adjudication and MaliciousSkillBench train/validation (see measured-results.md).
+    "low-noise": _DATA_DIR / "low_noise_policy.yaml",
+    "quiet": _DATA_DIR / "quiet_policy.yaml",
 }
 
 
@@ -116,7 +139,19 @@ class PipelinePolicy:
     )
     # Commands considered "execution sinks" for fetch+execute detection
     compound_fetch_exec_commands: list[str] = field(
-        default_factory=lambda: ["bash", "sh", "zsh", "source", "python", "python3", "."]
+        default_factory=lambda: [
+            "bash",
+            "sh",
+            "zsh",
+            "powershell",
+            "pwsh",
+            "invoke-expression",
+            "iex",
+            "source",
+            "python",
+            "python3",
+            ".",
+        ]
     )
     # Hint words that suggest data exfiltration in tool-chaining detection
     exfil_hints: list[str] = field(
@@ -272,6 +307,53 @@ class AnalyzersPolicy:
     static: bool = True
     bytecode: bool = True
     pipeline: bool = True
+    # Bounded, deterministic structured-flow correlation.  The permissive
+    # preset explicitly disables this pass; balanced/default and strict keep
+    # it enabled so fenced and cross-file behavior reaches the normal scanner.
+    correlation: bool = True
+
+
+@dataclass
+class CelPolicy:
+    """Controls the bounded CEL decision layer.
+
+    ``off`` disables evaluation while still authoritatively compiling selected
+    rule generations, ``shadow`` records what would be suppressed, and
+    ``enforce`` suppresses only rules whose manifest rollout is also
+    ``enforce``. The pinned cel-go helper is a core runtime.
+    """
+
+    mode: CelMode = CelMode.OFF
+
+
+@dataclass
+class AdjudicatorPolicy:
+    """Controls the per-finding adjudicator pass.
+
+    The adjudicator runs BETWEEN the deterministic analyzer phase and the
+    LLM analyzer phase. For each deterministic HIGH/CRITICAL finding it
+    asks an LLM whether the file around the matched line actually
+    contains the threat the rule was designed to catch. Findings the LLM
+    judges to be literal-regex false positives (verdict = ``false_positive``,
+    confidence >= ``min_fp_confidence``) are demoted to INFO for downstream
+    verdict computation. The original severity is preserved in the
+    finding's ``metadata['adjudication']`` record for audit.
+
+    **Safety property (load-bearing):** the adjudicator can only demote
+    findings, never promote them. LLM unavailable / parse error / timeout
+    all leave the finding at its original severity. False negatives cannot
+    be introduced by enabling this pass.
+
+    Cost: 0-3 LLM calls per typical skill, ~250 output tokens each.
+    """
+
+    # Master toggle. Default off preserves backwards-compatible behavior.
+    enabled: bool = False
+
+    # Minimum LLM confidence (1-5) required to demote a finding. A higher
+    # threshold trades demotion recall for demotion precision. 3 is the
+    # empirically-validated default from a 106-skill labeled corpus.
+    min_fp_confidence: int = 3
 
 
 @dataclass
@@ -284,9 +366,12 @@ class LLMAnalysisPolicy:
     cross-correlation.
 
     Content that fits within budget is sent in full — **no truncation**.
-    Content that exceeds the budget is skipped entirely and an
-    ``LLM_CONTEXT_BUDGET_EXCEEDED`` INFO finding is emitted with guidance
-    on which policy knob to increase.
+    Oversized code files may contribute bounded excerpts. Set
+    ``max_code_file_chars`` to zero to keep directly formatted code-file
+    contents out of LLM requests. Referenced files use
+    ``max_referenced_file_chars`` and may still be included within that limit.
+    Oversized instruction bodies and referenced files are skipped entirely,
+    with an ``LLM_CONTEXT_BUDGET_EXCEEDED`` INFO finding.
     """
 
     # -- Per-item limits (LLM analyzer uses these directly) --
@@ -302,6 +387,27 @@ class LLMAnalysisPolicy:
     # Meta analyzer multiplies the above limits by this factor.
     # e.g. 3× means meta gets 60 K instruction, 45 K/file, 300 K total.
     meta_budget_multiplier: float = 3.0
+
+    # -- Trusted reference domains --
+    # Organization's internal domains (Git repos, package registries, doc portals)
+    # considered trusted for transitive trust / supply chain analysis.
+    # LLM findings referencing only these domains are demoted to LOW.
+    # Mirrors the pattern of ``pipeline.known_installer_domains``.
+    trusted_reference_domains: set[str] = field(default_factory=set)
+
+    # -- Contextual-risk severity cap --
+    # When set (e.g. "LOW"), a finding the model itself labels CONTEXTUAL_RISK -- a
+    # risky capability whose intent, reach or execution is not established -- is capped
+    # at this severity; TRUE_POSITIVE findings are untouched. Empty means no cap. On
+    # MaliciousSkillBench development records a LOW cap took the judge's MEDIUM+
+    # false-positive rate from 23.6% to 6.9% for 5 points of recall.
+    contextual_risk_max_severity: str = ""
+    # -- Low-confidence severity cap --
+    # When set, a finding the model itself rates LOW confidence is capped at this severity.
+    # A middle operating point: with the current prompt a LOW cap took the real-skill MEDIUM+
+    # flag rate from 10.5% to 7.6%, and cost 2.5 points of recall on MaliciousSkillBench
+    # train/validation (3.6 on the test split).
+    low_confidence_max_severity: str = ""
 
     # -- Convenience helpers for the meta analyzer --
 
@@ -393,10 +499,15 @@ class ScanPolicy:
     sensitive_files: SensitiveFilesPolicy = field(default_factory=SensitiveFilesPolicy)
     command_safety: CommandSafetyPolicy = field(default_factory=CommandSafetyPolicy)
     analyzers: AnalyzersPolicy = field(default_factory=AnalyzersPolicy)
+    cel: CelPolicy = field(default_factory=CelPolicy)
+    adjudicator: AdjudicatorPolicy = field(default_factory=AdjudicatorPolicy)
     llm_analysis: LLMAnalysisPolicy = field(default_factory=LLMAnalysisPolicy)
     finding_output: FindingOutputPolicy = field(default_factory=FindingOutputPolicy)
     severity_overrides: list[SeverityOverride] = field(default_factory=list)
     disabled_rules: set[str] = field(default_factory=set)
+    # Scoped suppressions: silence or re-rate a rule for named skills/paths
+    # instead of disabling it for every skill in the run.
+    suppressions: list[SuppressionRule] = field(default_factory=list)
 
     # -----------------------------------------------------------------------
     # Convenience helpers
@@ -426,7 +537,7 @@ class ScanPolicy:
                     self._doc_fn_re_cache = None
             else:
                 self._doc_fn_re_cache = None
-        return self._doc_fn_re_cache  # type: ignore[attr-defined, no-any-return]
+        return self._doc_fn_re_cache
 
     @property
     def _compiled_benign_pipes(self) -> list[re.Pattern]:
@@ -434,7 +545,7 @@ class ScanPolicy:
         if not hasattr(self, "_benign_pipe_cache"):
             compiled = [c for p in self.pipeline.benign_pipe_targets if (c := _safe_compile(p)) is not None]
             self._benign_pipe_cache = compiled
-        return self._benign_pipe_cache  # type: ignore[attr-defined, no-any-return]
+        return self._benign_pipe_cache
 
     # -----------------------------------------------------------------------
     # Construction helpers
@@ -447,11 +558,23 @@ class ScanPolicy:
 
     @classmethod
     def from_preset(cls, name: str) -> ScanPolicy:
-        """Load a named preset policy: ``strict``, ``balanced``, or ``permissive``."""
+        """Load a named preset policy: ``strict``, ``balanced``, ``permissive``, ``low-noise`` or ``quiet``."""
         name_lower = name.lower()
-        if name_lower not in _PRESET_POLICIES:
+        # Select only fixed package-owned paths.  Avoid using request text as
+        # a path-producing mapping key even after membership validation.
+        if name_lower == "strict":
+            preset_path = _DATA_DIR / "strict_policy.yaml"
+        elif name_lower == "balanced":
+            preset_path = _DEFAULT_POLICY_PATH
+        elif name_lower == "permissive":
+            preset_path = _DATA_DIR / "permissive_policy.yaml"
+        elif name_lower == "low-noise":
+            preset_path = _DATA_DIR / "low_noise_policy.yaml"
+        elif name_lower == "quiet":
+            preset_path = _DATA_DIR / "quiet_policy.yaml"
+        else:
             raise ValueError(f"Unknown preset '{name}'. Available: {', '.join(sorted(_PRESET_POLICIES))}")
-        return cls.from_yaml(_PRESET_POLICIES[name_lower])
+        return cls.from_yaml(preset_path)
 
     @classmethod
     def preset_names(cls) -> list[str]:
@@ -466,15 +589,31 @@ class ScanPolicy:
         The YAML is first merged on top of the built-in defaults so that
         users only need to specify the sections they want to override.
         """
-        path = Path(path)
+        raw_path = os.fspath(path)
+        if "\x00" in raw_path:
+            raise ValueError("Policy path contains a null byte")
+        try:
+            normalized_path = os.path.realpath(os.path.expanduser(raw_path))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"Invalid policy path: {raw_path}") from exc
+        path = Path(normalized_path)
         if not path.exists():
-            raise FileNotFoundError(f"Policy file not found: {path}")
-
-        with open(path) as fh:
-            raw: dict[str, Any] = yaml.safe_load(fh) or {}
+            raise FileNotFoundError(f"Policy file not found: {raw_path}")
+        try:
+            content = read_text_strict(
+                path,
+                max_size_bytes=_MAX_POLICY_SIZE_BYTES,
+                root=path.parent,
+            )
+        except FileValidationError as exc:
+            raise ValueError(f"Invalid policy file: {exc}") from exc
+        raw_value = yaml.safe_load(content) or {}
+        if not isinstance(raw_value, dict):
+            raise ValueError("Policy YAML root must be a mapping")
+        raw: dict[str, Any] = _drop_null_values(raw_value)
 
         # If this IS the default file, just parse directly
-        is_default = path.resolve() == _DEFAULT_POLICY_PATH.resolve()
+        is_default = os.path.realpath(os.fspath(path)) == os.path.realpath(os.fspath(_DEFAULT_POLICY_PATH))
         if is_default:
             policy = cls._from_dict(raw)
         else:
@@ -488,7 +627,7 @@ class ScanPolicy:
     def to_yaml(self, path: str | Path) -> None:
         """Dump the full policy to a YAML file for editing."""
         data = self._to_dict()
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write("# Skill Scanner – Scan Policy\n")
             fh.write("# Customise this file to match your organisation's security bar.\n")
             fh.write("# Only include sections you want to override; omitted sections\n")
@@ -502,7 +641,7 @@ class ScanPolicy:
     @classmethod
     def _load_default_raw(cls) -> dict[str, Any]:
         if _DEFAULT_POLICY_PATH.exists():
-            with open(_DEFAULT_POLICY_PATH) as fh:
+            with open(_DEFAULT_POLICY_PATH, encoding="utf-8") as fh:
                 return yaml.safe_load(fh) or {}
         return {}
 
@@ -524,21 +663,31 @@ class ScanPolicy:
 
     @classmethod
     def _from_dict(cls, d: dict[str, Any]) -> ScanPolicy:
-        hf = d.get("hidden_files", {})
-        pl = d.get("pipeline", {})
-        ys = d.get("rule_scoping", {})
-        cr = d.get("credentials", {})
-        sc = d.get("system_cleanup", {})
-        fc = d.get("file_classification", {})
-        fl = d.get("file_limits", {})
-        at = d.get("analysis_thresholds", {})
-        sf = d.get("sensitive_files", {})
-        cs = d.get("command_safety", {})
-        az = d.get("analyzers", {})
-        la = d.get("llm_analysis", {})
-        fo = d.get("finding_output", {})
+        # Support direct callers that pass None for optional sections.
+        hf = d.get("hidden_files") or {}
+        pl = d.get("pipeline") or {}
+        ys = d.get("rule_scoping") or {}
+        cr = d.get("credentials") or {}
+        sc = d.get("system_cleanup") or {}
+        fc = d.get("file_classification") or {}
+        fl = d.get("file_limits") or {}
+        at = d.get("analysis_thresholds") or {}
+        sf = d.get("sensitive_files") or {}
+        cs = d.get("command_safety") or {}
+        az = d.get("analyzers") or {}
+        cel_policy = d.get("cel") or {}
+        aj = d.get("adjudicator") or {}
+        la = d.get("llm_analysis") or {}
+        fo = d.get("finding_output") or {}
 
-        severity_overrides = [SeverityOverride(**ovr) for ovr in d.get("severity_overrides", [])]
+        severity_overrides = [SeverityOverride(**ovr) for ovr in d.get("severity_overrides") or []]
+        suppressions = [suppression_from_dict(entry) for entry in d.get("suppressions") or []]
+
+        cel_mode_value = cel_policy.get("mode", "off")
+        # PyYAML's YAML 1.1 resolver treats an unquoted ``off`` as False.
+        # Accept that legacy representation while rejecting True/other values.
+        if cel_mode_value is False:
+            cel_mode_value = "off"
 
         return cls(
             policy_name=d.get("policy_name", "default"),
@@ -563,7 +712,20 @@ class ScanPolicy:
                     "compound_fetch_exec_prefixes", ["sudo", "env", "command", "time", "nohup", "nice"]
                 ),
                 compound_fetch_exec_commands=pl.get(
-                    "compound_fetch_exec_commands", ["bash", "sh", "zsh", "source", "python", "python3", "."]
+                    "compound_fetch_exec_commands",
+                    [
+                        "bash",
+                        "sh",
+                        "zsh",
+                        "powershell",
+                        "pwsh",
+                        "invoke-expression",
+                        "iex",
+                        "source",
+                        "python",
+                        "python3",
+                        ".",
+                    ],
                 ),
                 exfil_hints=pl.get(
                     "exfil_hints", ["send", "upload", "transmit", "webhook", "slack", "exfil", "forward"]
@@ -634,6 +796,12 @@ class ScanPolicy:
                 static=az.get("static", True),
                 bytecode=az.get("bytecode", True),
                 pipeline=az.get("pipeline", True),
+                correlation=az.get("correlation", True),
+            ),
+            cel=CelPolicy(mode=CelMode(str(cel_mode_value).lower())),
+            adjudicator=AdjudicatorPolicy(
+                enabled=aj.get("enabled", False),
+                min_fp_confidence=aj.get("min_fp_confidence", 3),
             ),
             llm_analysis=LLMAnalysisPolicy(
                 max_instruction_body_chars=la.get("max_instruction_body_chars", 20_000),
@@ -642,6 +810,9 @@ class ScanPolicy:
                 max_total_prompt_chars=la.get("max_total_prompt_chars", 100_000),
                 max_output_tokens=la.get("max_output_tokens", 8192),
                 meta_budget_multiplier=la.get("meta_budget_multiplier", 3.0),
+                trusted_reference_domains=set(la.get("trusted_reference_domains", [])),
+                contextual_risk_max_severity=str(la.get("contextual_risk_max_severity") or "").upper(),
+                low_confidence_max_severity=str(la.get("low_confidence_max_severity") or "").upper(),
             ),
             finding_output=FindingOutputPolicy(
                 dedupe_exact_findings=fo.get("dedupe_exact_findings", True),
@@ -665,7 +836,8 @@ class ScanPolicy:
                 attach_policy_fingerprint=fo.get("attach_policy_fingerprint", True),
             ),
             severity_overrides=severity_overrides,
-            disabled_rules=set(d.get("disabled_rules", [])),
+            disabled_rules=set(d.get("disabled_rules") or []),
+            suppressions=suppressions,
         )
 
     def _to_dict(self) -> dict[str, Any]:
@@ -757,6 +929,14 @@ class ScanPolicy:
                 "static": self.analyzers.static,
                 "bytecode": self.analyzers.bytecode,
                 "pipeline": self.analyzers.pipeline,
+                "correlation": self.analyzers.correlation,
+            },
+            "cel": {
+                "mode": self.cel.mode.value,
+            },
+            "adjudicator": {
+                "enabled": self.adjudicator.enabled,
+                "min_fp_confidence": self.adjudicator.min_fp_confidence,
             },
             "llm_analysis": {
                 "max_instruction_body_chars": self.llm_analysis.max_instruction_body_chars,
@@ -765,6 +945,9 @@ class ScanPolicy:
                 "max_total_prompt_chars": self.llm_analysis.max_total_prompt_chars,
                 "max_output_tokens": self.llm_analysis.max_output_tokens,
                 "meta_budget_multiplier": self.llm_analysis.meta_budget_multiplier,
+                "trusted_reference_domains": sorted(self.llm_analysis.trusted_reference_domains),
+                "contextual_risk_max_severity": self.llm_analysis.contextual_risk_max_severity,
+                "low_confidence_max_severity": self.llm_analysis.low_confidence_max_severity,
             },
             "finding_output": {
                 "dedupe_exact_findings": self.finding_output.dedupe_exact_findings,
@@ -778,4 +961,5 @@ class ScanPolicy:
                 {"rule_id": o.rule_id, "severity": o.severity, "reason": o.reason} for o in self.severity_overrides
             ],
             "disabled_rules": sorted(self.disabled_rules),
+            "suppressions": [s.to_dict() for s in self.suppressions],
         }

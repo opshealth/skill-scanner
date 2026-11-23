@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT DIRECTLY.
-     Regenerate with: uv run python scripts/generate_reference_docs.py -->
+     Regenerate with: uv run --python 3.12 python scripts/generate_reference_docs.py -->
 
 # CLI Command Reference
 
@@ -11,31 +11,39 @@ This page is generated from live `argparse` output and should match runtime beha
 |---|---|---|
 | `skill-scanner scan` | Scan a single skill package | `skill-scanner scan ./my-skill` |
 | `skill-scanner scan-all` | Scan multiple skill packages | `skill-scanner scan-all ./skills/ -r` |
+| `skill-scanner scan-repo` | Clone and scan a GitHub repo (owner/repo or full URL) | `skill-scanner scan-repo owner/repo` |
 | `skill-scanner list-analyzers` | Show available analyzers | `skill-scanner list-analyzers` |
-| `skill-scanner validate-rules` | Validate YAML rule signatures | `skill-scanner validate-rules` |
+| `skill-scanner validate-rules` | Validate selected schema-v2 packs and compile/type-check CEL | `skill-scanner validate-rules` |
 | `skill-scanner generate-policy` | Generate a policy YAML file | `skill-scanner generate-policy --preset strict` |
 | `skill-scanner configure-policy` | Interactive TUI policy editor | `skill-scanner configure-policy` |
 | `skill-scanner interactive` | Interactive setup wizard | `skill-scanner interactive` |
 | `skill-scanner-api` | Start the REST API server | `skill-scanner-api --port 8080` |
-| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit install` |
+| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit --install` |
 
 ## Common Flags
 
-Flags shared by `scan` and `scan-all`:
+Flags shared by `scan`, `scan-all` and `scan-repo`:
 
 | Flag | Default | Description |
 |---|---|---|
 | `--format FORMAT` | `summary` | Output format: `summary`, `json`, `markdown`, `table`, `sarif`, `html` |
-| `--output FILE` | stdout | Write output to a file instead of stdout |
+| `--output FILE` | stdout | Default output file path (overridden by `--output-<fmt>`) |
 | `--policy POLICY` | `balanced` | Policy preset name or path to a custom YAML |
+| `--cel-mode MODE` | policy | Override CEL mode: `off`, `shadow`, or `enforce` |
+| `--trusted-rule-pack PATH` | none | Load an administrator-trusted schema-v2 signature/YARA/CEL pack; repeatable |
 | `--use-llm` | off | Enable the LLM semantic analyzer |
 | `--use-behavioral` | off | Enable the behavioral analyzer |
 | `--use-virustotal` | off | Enable VirusTotal hash lookups |
 | `--use-aidefense` | off | Enable Cisco AI Defense analyzer |
-| `--enable-meta` | off | Enable the meta (cross-correlation) analyzer |
+| `--use-osv` | off | Enable OSV.dev dependency vulnerability scanning (no API key; requires network) |
+| `--llm-reasoning-effort LEVEL` | provider default | Optional reasoning depth: `disabled`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Direct Google GenAI SDK requests reject configured controls; LiteLLM-backed Gemini requests support them. |
+| `--llm-decompose` | off | Run the LLM analyzer once per focus and union the findings instead of making one general pass. Raises recall at roughly three times the model calls. Requires `--use-llm`. See [Optional semantic flags](#optional-semantic-flags). |
+| `--system-one-endpoint URL` | off | Optional System One screening endpoint speaking `POST /v1/systemone`. **Advisory only**: it can never change a finding, a severity or the verdict. `https`, or `http` on loopback. |
+| `--system-one-model NAME` | none | Model name for the System One endpoint. Required with `--system-one-endpoint`, and rejected without it. |
+| `--enable-meta` | off | Enable the meta (cross-correlation) analyzer. Measured to cost recall; leave it off unless you have measured it on your skills |
 | `--fail-on-findings` | off | Exit non-zero if critical or high findings are reported; equivalent to `--fail-on-severity high` (CI gate) |
 | `--fail-on-severity LEVEL` | off | Exit non-zero if findings at or above LEVEL exist (critical, high, medium, low, info) |
-| `--lenient` | off | Tolerate malformed skills: coerce bad fields, fill defaults, and continue instead of failing |
+| `--lenient` | off | Tolerate malformed YAML / missing fields: coerce bad fields, fill defaults, and continue instead of failing. Binary and non-UTF-8 files always fail. |
 | `--detailed` | off | Include full evidence in output |
 | `--compact` | off | Minimize output (JSON: no pretty-print) |
 | `--verbose` | off | Verbose logging |
@@ -49,16 +57,17 @@ Command: `python -m skill_scanner.cli.cli --help`
 
 ```text
 usage: cli.py [-h] [--version]
-              {scan,scan-all,list-analyzers,validate-rules,generate-policy,configure-policy,interactive}
+              {scan,scan-all,scan-repo,list-analyzers,validate-rules,generate-policy,configure-policy,interactive}
               ...
 
 Skill Scanner - Security scanner for agent skills packages
 
 positional arguments:
-  {scan,scan-all,list-analyzers,validate-rules,generate-policy,configure-policy,interactive}
+  {scan,scan-all,scan-repo,list-analyzers,validate-rules,generate-policy,configure-policy,interactive}
                         Command to execute
     scan                Scan a single skill package
     scan-all            Scan multiple skill packages
+    scan-repo           Clone and scan a GitHub repository for skills
     list-analyzers      List available analyzers
     validate-rules      Validate rule signatures
     generate-policy     Generate a default scan policy YAML
@@ -97,17 +106,23 @@ usage: cli.py scan [-h] [--format {summary,json,markdown,table,sarif,html}]
                    [--output-sarif OUTPUT_SARIF]
                    [--output-markdown OUTPUT_MARKDOWN]
                    [--output-html OUTPUT_HTML] [--output-table OUTPUT_TABLE]
-                   [--detailed] [--compact] [--verbose] [--fail-on-findings]
+                   [--detailed] [--render-markdown | --no-render-markdown]
+                   [--compact] [--verbose] [--fail-on-findings]
                    [--fail-on-severity LEVEL] [--use-behavioral] [--use-llm]
                    [--use-virustotal] [--vt-api-key VT_API_KEY]
                    [--vt-upload-files] [--use-aidefense]
                    [--aidefense-api-key AIDEFENSE_API_KEY]
-                   [--aidefense-api-url AIDEFENSE_API_URL]
-                   [--llm-provider {anthropic,openai}]
-                   [--llm-consensus-runs N] [--llm-max-tokens N]
-                   [--use-trigger] [--enable-meta]
-                   [--policy PRESET_OR_PATH] [--lenient] [--custom-rules PATH]
-                   [--taxonomy PATH] [--threat-mapping PATH]
+                   [--aidefense-api-url AIDEFENSE_API_URL] [--use-osv]
+                   [--llm-provider {anthropic,openai,openai-compatible}]
+                   [--system-one-endpoint URL] [--system-one-model NAME]
+                   [--llm-decompose] [--llm-consensus-runs N]
+                   [--llm-max-tokens N] [--llm-reasoning-effort LEVEL]
+                   [--use-trigger] [--enable-meta] [--adjudicate]
+                   [--policy PRESET_OR_PATH] [--lenient]
+                   [--skill-file FILENAME] [--custom-rules PATH]
+                   [--rule-packs PACK [PACK ...]] [--trusted-rule-pack PATH]
+                   [--cel-mode {off,shadow,enforce}] [--taxonomy PATH]
+                   [--threat-mapping PATH]
                    skill_directory
 
 positional arguments:
@@ -121,23 +136,23 @@ options:
                         e.g. --format markdown --format sarif. Use 'sarif' for
                         GitHub Code Scanning, 'html' for interactive report.
   --output OUTPUT, -o OUTPUT
-                        Output file path (for the first --format)
+                        Default output file path (overridden by --output-<fmt>
+                        for a specific format)
   --output-json OUTPUT_JSON
-                        Write JSON report to this file (when using multiple
-                        --format)
+                        Write JSON report to this file
   --output-sarif OUTPUT_SARIF
-                        Write SARIF report to this file (when using multiple
-                        --format)
+                        Write SARIF report to this file
   --output-markdown OUTPUT_MARKDOWN
-                        Write Markdown report to this file (when using
-                        multiple --format)
+                        Write Markdown report to this file
   --output-html OUTPUT_HTML
-                        Write HTML report to this file (when using multiple
-                        --format)
+                        Write HTML report to this file
   --output-table OUTPUT_TABLE
-                        Write Table report to this file (when using multiple
-                        --format)
+                        Write Table report to this file
   --detailed            Include detailed findings (Markdown output only)
+  --render-markdown     With --format markdown: render markdown even when
+                        stdout is not detected as a TTY.
+  --no-render-markdown  With --format markdown to terminal: print raw markdown
+                        instead of rendering (for pipe/copy).
   --compact             Compact JSON output
   --verbose             Include per-finding policy fingerprints, co-occurrence
                         metadata, and keep meta-analyzer false positives in
@@ -157,23 +172,74 @@ options:
                         AI Defense API key (or set AI_DEFENSE_API_KEY)
   --aidefense-api-url AIDEFENSE_API_URL
                         AI Defense API URL (optional, defaults to US region)
-  --llm-provider {anthropic,openai}
-                        LLM provider
+  --use-osv             Enable OSV.dev dependency vulnerability scanning (no
+                        API key; requires network)
+  --llm-provider {anthropic,openai,openai-compatible}
+                        LLM provider shortcut or explicit OpenAI-compatible
+                        override
+  --system-one-endpoint URL
+                        Optional System One screening endpoint speaking POST
+                        /v1/systemone. Advisory only: it records a calibrated
+                        probability and can never change a finding, a severity
+                        or the verdict. The model measured for this scored
+                        inverted against labelled corpora, so acting on it
+                        would make results worse; see docs/reference/measured-
+                        results.md before relying on it.
+  --system-one-model NAME
+                        Model name to send to the System One endpoint.
+                        Required with --system-one-endpoint.
+  --llm-decompose       Run the LLM analyzer once per focus (declared purpose,
+                        policy surface, security behaviors) and union the
+                        findings, instead of one general pass. Raises recall
+                        where a single pass was missing findings, at roughly
+                        three times the model calls. Measured effect varies by
+                        corpus and model; see docs/reference/measured-
+                        results.md.
   --llm-consensus-runs N
                         Run LLM analysis N times and keep only findings with
                         majority agreement (reduces false positives, increases
                         cost)
   --llm-max-tokens N    Maximum output tokens for LLM responses (default:
                         8192). Raise if scans produce truncated JSON.
+  --llm-reasoning-effort LEVEL
+                        Optional LLM reasoning effort: disabled, minimal, low,
+                        medium, high, xhigh, or max. Unset preserves the
+                        provider default.
   --use-trigger         Enable trigger specificity analysis
-  --enable-meta         Enable meta-analysis FP filtering (2+ analyzers)
+  --enable-meta         Enable the meta-analyzer (2+ analyzers). Off by
+                        default: measured to cost recall
+  --adjudicate          Enable per-finding adjudicator: for each deterministic
+                        HIGH/CRITICAL finding, ask the LLM whether the matched
+                        content is a real threat or a literal-regex false
+                        positive. Demote-only (never promotes) — LLM errors
+                        leave findings at original severity. Uses
+                        SKILL_SCANNER_LLM_MODEL (or
+                        SKILL_SCANNER_ADJUDICATOR_LLM_MODEL to override).
   --policy PRESET_OR_PATH
-                        Scan policy: preset name (strict, balanced,
-                        permissive) or path to custom YAML
-  --lenient             Tolerate malformed skills: coerce bad fields, fill
-                        defaults, and continue instead of failing
+                        Scan policy: a preset (balanced, low-noise, quiet,
+                        strict, permissive) or a path to custom YAML. For
+                        fewer false positives use low-noise or quiet together
+                        with --use-llm; quiet requires the LLM judge
+  --lenient             Tolerate malformed YAML / missing fields: coerce bad
+                        fields, fill defaults, and continue instead of
+                        failing. Binary and non-UTF-8 files always fail.
+  --skill-file FILENAME
+                        Custom metadata filename to use instead of SKILL.md
+                        (e.g. README.md)
   --custom-rules PATH   Path to directory containing custom YARA rules (.yara
                         files)
+  --rule-packs PACK [PACK ...]
+                        Additional signature rule packs to enable (e.g.
+                        'atr'). Use '--rule-packs list' to show available
+                        packs.
+  --trusted-rule-pack PATH
+                        Path to an administrator-trusted schema-v2 rule pack.
+                        May be specified multiple times. Trusted packs are
+                        strictly validated and may contain bounded CEL gates,
+                        signatures, and YARA rules.
+  --cel-mode {off,shadow,enforce}
+                        Override the scan policy CEL mode (off, shadow, or
+                        enforce)
   --taxonomy PATH       Path to custom taxonomy JSON/YAML (overrides
                         SKILL_SCANNER_TAXONOMY_PATH)
   --threat-mapping PATH
@@ -197,19 +263,25 @@ usage: cli.py scan-all [-h] [--recursive] [--check-overlap]
                        [--output-sarif OUTPUT_SARIF]
                        [--output-markdown OUTPUT_MARKDOWN]
                        [--output-html OUTPUT_HTML]
-                       [--output-table OUTPUT_TABLE] [--detailed] [--compact]
+                       [--output-table OUTPUT_TABLE] [--detailed]
+                       [--render-markdown | --no-render-markdown] [--compact]
                        [--verbose] [--fail-on-findings]
                        [--fail-on-severity LEVEL] [--use-behavioral]
                        [--use-llm] [--use-virustotal]
                        [--vt-api-key VT_API_KEY] [--vt-upload-files]
                        [--use-aidefense]
                        [--aidefense-api-key AIDEFENSE_API_KEY]
-                       [--aidefense-api-url AIDEFENSE_API_URL]
-                       [--llm-provider {anthropic,openai}]
-                       [--llm-consensus-runs N] [--llm-max-tokens N]
-                       [--use-trigger]
-                       [--enable-meta] [--policy PRESET_OR_PATH] [--lenient]
-                       [--custom-rules PATH] [--taxonomy PATH]
+                       [--aidefense-api-url AIDEFENSE_API_URL] [--use-osv]
+                       [--llm-provider {anthropic,openai,openai-compatible}]
+                       [--system-one-endpoint URL] [--system-one-model NAME]
+                       [--llm-decompose] [--llm-consensus-runs N]
+                       [--llm-max-tokens N] [--llm-reasoning-effort LEVEL]
+                       [--use-trigger] [--enable-meta] [--adjudicate]
+                       [--policy PRESET_OR_PATH] [--lenient]
+                       [--skill-file FILENAME] [--custom-rules PATH]
+                       [--rule-packs PACK [PACK ...]]
+                       [--trusted-rule-pack PATH]
+                       [--cel-mode {off,shadow,enforce}] [--taxonomy PATH]
                        [--threat-mapping PATH]
                        skills_directory
 
@@ -226,23 +298,23 @@ options:
                         e.g. --format markdown --format sarif. Use 'sarif' for
                         GitHub Code Scanning, 'html' for interactive report.
   --output OUTPUT, -o OUTPUT
-                        Output file path (for the first --format)
+                        Default output file path (overridden by --output-<fmt>
+                        for a specific format)
   --output-json OUTPUT_JSON
-                        Write JSON report to this file (when using multiple
-                        --format)
+                        Write JSON report to this file
   --output-sarif OUTPUT_SARIF
-                        Write SARIF report to this file (when using multiple
-                        --format)
+                        Write SARIF report to this file
   --output-markdown OUTPUT_MARKDOWN
-                        Write Markdown report to this file (when using
-                        multiple --format)
+                        Write Markdown report to this file
   --output-html OUTPUT_HTML
-                        Write HTML report to this file (when using multiple
-                        --format)
+                        Write HTML report to this file
   --output-table OUTPUT_TABLE
-                        Write Table report to this file (when using multiple
-                        --format)
+                        Write Table report to this file
   --detailed            Include detailed findings (Markdown output only)
+  --render-markdown     With --format markdown: render markdown even when
+                        stdout is not detected as a TTY.
+  --no-render-markdown  With --format markdown to terminal: print raw markdown
+                        instead of rendering (for pipe/copy).
   --compact             Compact JSON output
   --verbose             Include per-finding policy fingerprints, co-occurrence
                         metadata, and keep meta-analyzer false positives in
@@ -262,23 +334,240 @@ options:
                         AI Defense API key (or set AI_DEFENSE_API_KEY)
   --aidefense-api-url AIDEFENSE_API_URL
                         AI Defense API URL (optional, defaults to US region)
-  --llm-provider {anthropic,openai}
-                        LLM provider
+  --use-osv             Enable OSV.dev dependency vulnerability scanning (no
+                        API key; requires network)
+  --llm-provider {anthropic,openai,openai-compatible}
+                        LLM provider shortcut or explicit OpenAI-compatible
+                        override
+  --system-one-endpoint URL
+                        Optional System One screening endpoint speaking POST
+                        /v1/systemone. Advisory only: it records a calibrated
+                        probability and can never change a finding, a severity
+                        or the verdict. The model measured for this scored
+                        inverted against labelled corpora, so acting on it
+                        would make results worse; see docs/reference/measured-
+                        results.md before relying on it.
+  --system-one-model NAME
+                        Model name to send to the System One endpoint.
+                        Required with --system-one-endpoint.
+  --llm-decompose       Run the LLM analyzer once per focus (declared purpose,
+                        policy surface, security behaviors) and union the
+                        findings, instead of one general pass. Raises recall
+                        where a single pass was missing findings, at roughly
+                        three times the model calls. Measured effect varies by
+                        corpus and model; see docs/reference/measured-
+                        results.md.
   --llm-consensus-runs N
                         Run LLM analysis N times and keep only findings with
                         majority agreement (reduces false positives, increases
                         cost)
   --llm-max-tokens N    Maximum output tokens for LLM responses (default:
                         8192). Raise if scans produce truncated JSON.
+  --llm-reasoning-effort LEVEL
+                        Optional LLM reasoning effort: disabled, minimal, low,
+                        medium, high, xhigh, or max. Unset preserves the
+                        provider default.
   --use-trigger         Enable trigger specificity analysis
-  --enable-meta         Enable meta-analysis FP filtering (2+ analyzers)
+  --enable-meta         Enable the meta-analyzer (2+ analyzers). Off by
+                        default: measured to cost recall
+  --adjudicate          Enable per-finding adjudicator: for each deterministic
+                        HIGH/CRITICAL finding, ask the LLM whether the matched
+                        content is a real threat or a literal-regex false
+                        positive. Demote-only (never promotes) — LLM errors
+                        leave findings at original severity. Uses
+                        SKILL_SCANNER_LLM_MODEL (or
+                        SKILL_SCANNER_ADJUDICATOR_LLM_MODEL to override).
   --policy PRESET_OR_PATH
-                        Scan policy: preset name (strict, balanced,
-                        permissive) or path to custom YAML
-  --lenient             Tolerate malformed skills: coerce bad fields, fill
-                        defaults, and continue instead of failing
+                        Scan policy: a preset (balanced, low-noise, quiet,
+                        strict, permissive) or a path to custom YAML. For
+                        fewer false positives use low-noise or quiet together
+                        with --use-llm; quiet requires the LLM judge
+  --lenient             Tolerate malformed YAML / missing fields: coerce bad
+                        fields, fill defaults, and continue instead of
+                        failing. Binary and non-UTF-8 files always fail.
+  --skill-file FILENAME
+                        Custom metadata filename to use instead of SKILL.md
+                        (e.g. README.md)
   --custom-rules PATH   Path to directory containing custom YARA rules (.yara
                         files)
+  --rule-packs PACK [PACK ...]
+                        Additional signature rule packs to enable (e.g.
+                        'atr'). Use '--rule-packs list' to show available
+                        packs.
+  --trusted-rule-pack PATH
+                        Path to an administrator-trusted schema-v2 rule pack.
+                        May be specified multiple times. Trusted packs are
+                        strictly validated and may contain bounded CEL gates,
+                        signatures, and YARA rules.
+  --cel-mode {off,shadow,enforce}
+                        Override the scan policy CEL mode (off, shadow, or
+                        enforce)
+  --taxonomy PATH       Path to custom taxonomy JSON/YAML (overrides
+                        SKILL_SCANNER_TAXONOMY_PATH)
+  --threat-mapping PATH
+                        Path to custom threat mapping JSON (overrides
+                        SKILL_SCANNER_THREAT_MAPPING_PATH)
+```
+
+</details>
+
+## scan-repo
+
+Command: `python -m skill_scanner.cli.cli scan-repo --help`
+
+<details>
+<summary>Full <code>scan-repo</code> help output</summary>
+
+```text
+usage: cli.py scan-repo [-h] [--recursive | --no-recursive | -r]
+                        [--check-overlap]
+                        [--format {summary,json,markdown,table,sarif,html}]
+                        [--output OUTPUT] [--output-json OUTPUT_JSON]
+                        [--output-sarif OUTPUT_SARIF]
+                        [--output-markdown OUTPUT_MARKDOWN]
+                        [--output-html OUTPUT_HTML]
+                        [--output-table OUTPUT_TABLE] [--detailed]
+                        [--render-markdown | --no-render-markdown] [--compact]
+                        [--verbose] [--fail-on-findings]
+                        [--fail-on-severity LEVEL] [--use-behavioral]
+                        [--use-llm] [--use-virustotal]
+                        [--vt-api-key VT_API_KEY] [--vt-upload-files]
+                        [--use-aidefense]
+                        [--aidefense-api-key AIDEFENSE_API_KEY]
+                        [--aidefense-api-url AIDEFENSE_API_URL] [--use-osv]
+                        [--llm-provider {anthropic,openai,openai-compatible}]
+                        [--system-one-endpoint URL] [--system-one-model NAME]
+                        [--llm-decompose] [--llm-consensus-runs N]
+                        [--llm-max-tokens N] [--llm-reasoning-effort LEVEL]
+                        [--use-trigger] [--enable-meta] [--adjudicate]
+                        [--policy PRESET_OR_PATH] [--lenient]
+                        [--skill-file FILENAME] [--custom-rules PATH]
+                        [--rule-packs PACK [PACK ...]]
+                        [--trusted-rule-pack PATH]
+                        [--cel-mode {off,shadow,enforce}] [--taxonomy PATH]
+                        [--threat-mapping PATH]
+                        repo
+
+positional arguments:
+  repo                  GitHub repo URL (https://github.com/owner/repo) or
+                        shorthand (owner/repo)
+
+options:
+  -h, --help            show this help message and exit
+  --recursive, --no-recursive, -r
+                        Recursively search for skills (default: True; use
+                        --no-recursive to disable)
+  --check-overlap       Enable cross-skill description overlap check
+  --format {summary,json,markdown,table,sarif,html}
+                        Output format (default: summary). May be specified
+                        multiple times to produce several reports in one run,
+                        e.g. --format markdown --format sarif. Use 'sarif' for
+                        GitHub Code Scanning, 'html' for interactive report.
+  --output OUTPUT, -o OUTPUT
+                        Default output file path (overridden by --output-<fmt>
+                        for a specific format)
+  --output-json OUTPUT_JSON
+                        Write JSON report to this file
+  --output-sarif OUTPUT_SARIF
+                        Write SARIF report to this file
+  --output-markdown OUTPUT_MARKDOWN
+                        Write Markdown report to this file
+  --output-html OUTPUT_HTML
+                        Write HTML report to this file
+  --output-table OUTPUT_TABLE
+                        Write Table report to this file
+  --detailed            Include detailed findings (Markdown output only)
+  --render-markdown     With --format markdown: render markdown even when
+                        stdout is not detected as a TTY.
+  --no-render-markdown  With --format markdown to terminal: print raw markdown
+                        instead of rendering (for pipe/copy).
+  --compact             Compact JSON output
+  --verbose             Include per-finding policy fingerprints, co-occurrence
+                        metadata, and keep meta-analyzer false positives in
+                        output
+  --fail-on-findings    Exit with error if critical/high findings
+  --fail-on-severity LEVEL
+                        Exit with error if findings at or above LEVEL exist
+                        (critical, high, medium, low, info)
+  --use-behavioral      Enable behavioral dataflow analysis
+  --use-llm             Enable LLM-based semantic analysis (requires API key)
+  --use-virustotal      Enable VirusTotal scanning (requires API key)
+  --vt-api-key VT_API_KEY
+                        VirusTotal API key (or set VIRUSTOTAL_API_KEY)
+  --vt-upload-files     Upload unknown files to VirusTotal
+  --use-aidefense       Enable AI Defense analyzer (requires API key)
+  --aidefense-api-key AIDEFENSE_API_KEY
+                        AI Defense API key (or set AI_DEFENSE_API_KEY)
+  --aidefense-api-url AIDEFENSE_API_URL
+                        AI Defense API URL (optional, defaults to US region)
+  --use-osv             Enable OSV.dev dependency vulnerability scanning (no
+                        API key; requires network)
+  --llm-provider {anthropic,openai,openai-compatible}
+                        LLM provider shortcut or explicit OpenAI-compatible
+                        override
+  --system-one-endpoint URL
+                        Optional System One screening endpoint speaking POST
+                        /v1/systemone. Advisory only: it records a calibrated
+                        probability and can never change a finding, a severity
+                        or the verdict. The model measured for this scored
+                        inverted against labelled corpora, so acting on it
+                        would make results worse; see docs/reference/measured-
+                        results.md before relying on it.
+  --system-one-model NAME
+                        Model name to send to the System One endpoint.
+                        Required with --system-one-endpoint.
+  --llm-decompose       Run the LLM analyzer once per focus (declared purpose,
+                        policy surface, security behaviors) and union the
+                        findings, instead of one general pass. Raises recall
+                        where a single pass was missing findings, at roughly
+                        three times the model calls. Measured effect varies by
+                        corpus and model; see docs/reference/measured-
+                        results.md.
+  --llm-consensus-runs N
+                        Run LLM analysis N times and keep only findings with
+                        majority agreement (reduces false positives, increases
+                        cost)
+  --llm-max-tokens N    Maximum output tokens for LLM responses (default:
+                        8192). Raise if scans produce truncated JSON.
+  --llm-reasoning-effort LEVEL
+                        Optional LLM reasoning effort: disabled, minimal, low,
+                        medium, high, xhigh, or max. Unset preserves the
+                        provider default.
+  --use-trigger         Enable trigger specificity analysis
+  --enable-meta         Enable the meta-analyzer (2+ analyzers). Off by
+                        default: measured to cost recall
+  --adjudicate          Enable per-finding adjudicator: for each deterministic
+                        HIGH/CRITICAL finding, ask the LLM whether the matched
+                        content is a real threat or a literal-regex false
+                        positive. Demote-only (never promotes) — LLM errors
+                        leave findings at original severity. Uses
+                        SKILL_SCANNER_LLM_MODEL (or
+                        SKILL_SCANNER_ADJUDICATOR_LLM_MODEL to override).
+  --policy PRESET_OR_PATH
+                        Scan policy: a preset (balanced, low-noise, quiet,
+                        strict, permissive) or a path to custom YAML. For
+                        fewer false positives use low-noise or quiet together
+                        with --use-llm; quiet requires the LLM judge
+  --lenient             Tolerate malformed YAML / missing fields: coerce bad
+                        fields, fill defaults, and continue instead of
+                        failing. Binary and non-UTF-8 files always fail.
+  --skill-file FILENAME
+                        Custom metadata filename to use instead of SKILL.md
+                        (e.g. README.md)
+  --custom-rules PATH   Path to directory containing custom YARA rules (.yara
+                        files)
+  --rule-packs PACK [PACK ...]
+                        Additional signature rule packs to enable (e.g.
+                        'atr'). Use '--rule-packs list' to show available
+                        packs.
+  --trusted-rule-pack PATH
+                        Path to an administrator-trusted schema-v2 rule pack.
+                        May be specified multiple times. Trusted packs are
+                        strictly validated and may contain bounded CEL gates,
+                        signatures, and YARA rules.
+  --cel-mode {off,shadow,enforce}
+                        Override the scan policy CEL mode (off, shadow, or
+                        enforce)
   --taxonomy PATH       Path to custom taxonomy JSON/YAML (overrides
                         SKILL_SCANNER_TAXONOMY_PATH)
   --threat-mapping PATH
@@ -297,12 +586,16 @@ Command: `python -m skill_scanner.cli.cli validate-rules --help`
 
 ```text
 usage: cli.py validate-rules [-h] [--rules-file RULES_FILE]
+                             [--trusted-rule-pack PATH]
 
 options:
   -h, --help            show this help message and exit
   --rules-file RULES_FILE
                         Path to YAML rules file or directory (default: built-
                         in signatures)
+  --trusted-rule-pack PATH
+                        Path to an administrator-trusted schema-v2 rule pack;
+                        may be specified multiple times
 ```
 
 </details>
@@ -316,13 +609,13 @@ Command: `python -m skill_scanner.cli.cli generate-policy --help`
 
 ```text
 usage: cli.py generate-policy [-h] [--output OUTPUT]
-                              [--preset {strict,balanced,permissive}]
+                              [--preset {balanced,low-noise,permissive,quiet,strict}]
 
 options:
   -h, --help            show this help message and exit
   --output OUTPUT, -o OUTPUT
                         Output file path
-  --preset {strict,balanced,permissive}
+  --preset {balanced,low-noise,permissive,quiet,strict}
                         Base preset
 ```
 
@@ -391,13 +684,15 @@ Command: `python -m skill_scanner.hooks.pre_commit --help`
 
 ```text
 usage: pre_commit.py [-h] [--severity {critical,high,medium,low}]
-                     [--skills-path SKILLS_PATH] [--all] [--lenient]
-                     [install]
+                     [--skills-path SKILLS_PATH] [--scan-all] [--install]
+                     [--lenient]
+                     [FILE ...]
 
 Pre-commit hook for scanning agent skills
 
 positional arguments:
-  install               Install pre-commit hook
+  FILE                  Changed files supplied by pre-commit (falls back to
+                        staged files when omitted)
 
 options:
   -h, --help            show this help message and exit
@@ -405,8 +700,45 @@ options:
                         Override severity threshold from config
   --skills-path SKILLS_PATH
                         Override skills path from config
-  --all                 Scan all skills, not just staged ones
+  --scan-all            Scan all skills, not just staged ones
+  --install             Install the built-in pre-commit hook
   --lenient             Tolerate malformed skills instead of failing
 ```
 
 </details>
+
+## Optional semantic flags
+
+Both of these are accepted by `scan`, `scan-all` and `scan-repo`, and both are off by
+default.
+
+### `--llm-decompose`
+
+Run the LLM analyzer once per focus — declared purpose against actual behaviour, policy
+and instruction surface, and concrete security behaviours — and union the findings,
+instead of making one general pass. It raises recall where a single pass was missing
+findings, at roughly three times the model calls.
+
+The size of the gain depends on the model and on how much headroom the single pass left,
+and on one positive-only corpus recall fell. Read [measured
+results](measured-results.md) before assuming a figure transfers.
+
+Requires `--use-llm`.
+
+### `--system-one-endpoint` and `--system-one-model`
+
+| Flag | Meaning |
+|---|---|
+| `--system-one-endpoint URL` | A System One endpoint speaking `POST /v1/systemone`. Must be `https`, or `http` on loopback; a plaintext remote endpoint is refused so skill content is not sent in clear text. |
+| `--system-one-model NAME` | The model name to send to that endpoint. Required whenever the endpoint is set; supplying one without the other is an error rather than a silent default. |
+
+The bearer token is read from `SKILL_SCANNER_SYSTEM_ONE_API_KEY` and never from the
+command line, so it does not land in shell history or a process listing.
+
+**This tier is advisory only.** It records a calibrated probability and cannot emit a
+finding, change a severity, or alter the verdict. That is deliberate: across 439 records
+and two prompt framings, the model measured scored *inverted* with respect to the label
+(AUC 0.25–0.31), so wiring it into severity would have made the scanner worse. The
+integration ships because the protocol is model-agnostic and a future model may separate
+the classes. Demonstrating that separation on a corpus is the precondition for anything
+acting on it. See [measured results](measured-results.md).

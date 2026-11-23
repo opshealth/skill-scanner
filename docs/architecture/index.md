@@ -10,8 +10,10 @@ Skill Scanner is a modular security scanner for agent skill packages. It combine
 ## Explore by Topic
 
 - **[Scanning Pipeline](./scanning-pipeline.md)** -- How scans execute end-to-end: two-phase analysis, post-processing, and output.
+- **[CEL Decision Layer](./cel-decision-layer.md)** -- Typed fact projection, bounded expressions, rollout modes, fail-open behavior, and audit telemetry.
 - **[Analyzers](./analyzers/index.md)** -- The 10 detection engines — capability matrix, deep dives, and selection guide.
 - **[Threat Model](./threat-taxonomy.md)** -- Cisco AI Security Framework taxonomy, binary handling, and risk classification.
+- **[Taxonomy Reference](./taxonomy-reference.md)** -- Definitions of every objective, technique and sub-technique in taxonomy 2.0.0.
 - **[Extending](./analyzers/writing-custom-rules.md)** -- Write custom YAML signatures, YARA rules, and Python checks. Add new analyzers.
 
 ## High-Level Layout
@@ -49,7 +51,7 @@ graph TB
         PACKS["data/packs/core<br>signatures + yara + python checks"]
         PROMPTS["data/prompts<br>LLM schemas/prompts"]
         TAXONOMY["Threat mapping<br>AITech taxonomy"]
-        PRESETS["data/*_policy.yaml<br>strict/balanced/permissive"]
+        PRESETS["data/*_policy.yaml<br>strict/balanced/permissive/low-noise/quiet"]
     end
 
     subgraph Output[Output]

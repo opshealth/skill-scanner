@@ -25,12 +25,16 @@ pip install cisco-ai-skill-scanner[all]
 
 ## Basic Usage
 
-### Environment Setup (Optional)
+### Environment Setup
+
+Configure the LLM judge. Every recommended setup uses it, because the rules alone catch only about 8%
+of held-out malicious skills. A local model works too; see
+[LLM Providers](https://cisco-ai-defense.github.io/docs/skill-scanner/llm-providers).
 
 ```bash
-# For LLM analyzer and Meta-analyzer
+# The LLM judge
 export SKILL_SCANNER_LLM_API_KEY="your_api_key"
-export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-4-20250514"
+export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-5-5"
 
 # For VirusTotal binary scanning
 export VIRUSTOTAL_API_KEY="your_virustotal_api_key"
@@ -61,7 +65,17 @@ uv run skill-scanner scan evals/skills/safe-skills/simple-math
 skill-scanner scan evals/skills/safe-skills/simple-math
 ```
 
-By default, `scan` runs the core analyzers: **static + bytecode + pipeline**.
+By default, `scan` runs the core analyzers: **static + bytecode + pipeline + correlation**.
+That is a first test that the install works. For real use, add the judge:
+
+```bash
+skill-scanner scan /path/to/skill --use-llm --policy balanced --fail-on-severity high
+```
+
+The correlation pass joins bounded, structured source/sink facts and never executes skill content.
+Balanced/default mode then evaluates bundled CEL gates in shadow, recording
+decisions without suppressing findings. Permissive mode uses CEL off and
+disables correlation.
 
 ### Scan Multiple Skills
 
@@ -124,8 +138,11 @@ Findings Summary:
 # List available analyzers
 skill-scanner list-analyzers
 
-# Validate rule signatures
+# Validate selected packs and compile/type-check CEL
 skill-scanner validate-rules
+
+# Inspect typed CEL decisions in JSON output
+skill-scanner scan /path/to/skill --cel-mode shadow --format json
 
 # Get help
 skill-scanner --help
@@ -164,15 +181,19 @@ skill-scanner scan-all evals/skills --format table
 
 Use built-in presets or a custom policy to tune detection sensitivity:
 
+Five presets ship: `balanced` (default), `low-noise`, `quiet`, `strict` and `permissive`.
+Which to use for which job, with measured recall, false-positive rate and F1, is in
+[Recommended Settings](https://cisco-ai-defense.github.io/docs/skill-scanner/recommended-settings).
+
 ```bash
-# Use a stricter preset
-skill-scanner scan /path/to/skill --policy strict
+# Your own skills: fewer harmless flags, same detections
+skill-scanner scan /path/to/skill --use-llm --policy low-noise
 
-# Use a more permissive preset
-skill-scanner scan /path/to/skill --policy permissive
+# Third-party skills with the judge, fewest false positives (never without --use-llm)
+skill-scanner scan /path/to/skill --use-llm --policy quiet
 
-# Generate a custom policy YAML to edit
-skill-scanner generate-policy -o my_policy.yaml
+# Generate a custom policy YAML to edit, starting from a preset
+skill-scanner generate-policy --preset low-noise -o my_policy.yaml
 
 # Interactive policy configurator (TUI)
 skill-scanner configure-policy
@@ -190,8 +211,8 @@ skill-scanner scan /path/to/skill \
   --use-virustotal
 ```
 
-**LLM provider note:** `--llm-provider` currently accepts `anthropic` or `openai`.
-For Bedrock, Vertex, Azure, Gemini, and other LiteLLM backends, set provider-specific model strings and environment variables (see [Dependencies and LLM Providers](../reference/dependencies-and-llm-providers.md)).
+**LLM provider note:** `--llm-provider` accepts `anthropic`, `openai` or `openai-compatible`.
+For Bedrock, Vertex, Azure, Gemini, Ollama, gateways and other LiteLLM backends, set provider-specific model strings and environment variables (see [Dependencies and LLM Providers](../reference/dependencies-and-llm-providers.md)).
 
 ### Cross-Skill Analysis
 ```bash
@@ -200,33 +221,51 @@ skill-scanner scan-all /path/to/skills --check-overlap
 
 ### Lenient Mode
 
-Tolerate malformed skills (missing fields, non-string descriptions) instead of failing:
+Tolerate malformed skills (missing fields, non-string descriptions) instead of failing. When `SKILL.md` is absent, lenient mode falls back to scanning `.md` files in the directory as instruction bodies — enabling support for non-Codex/Cursor formats such as Claude Code `.claude/commands/*.md`:
 
 ```bash
 skill-scanner scan /path/to/skill --lenient
 skill-scanner scan-all /path/to/skills --recursive --lenient
+
+# Scan a Claude Code commands directory (no SKILL.md)
+skill-scanner scan .claude/commands/deploy --lenient
+
+# Use a custom metadata filename instead of SKILL.md
+skill-scanner scan /path/to/skill --skill-file README.md
 ```
 
 ### Pre-commit Hook
 
-Using the [pre-commit](https://pre-commit.com/) framework (recommended):
+Using the [pre-commit](https://pre-commit.com/) framework, with the LLM judge:
 
 ```yaml
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/cisco-ai-defense/skill-scanner
-    rev: v1.0.0  # use the latest release tag
+    rev: 2.3.2  # the latest release tag (no "v" prefix)
     hooks:
       - id: skill-scanner
 ```
 
-Or install the built-in hook directly:
+Turn the judge on in `.skill_scannerrc` at the repository root (`use_llm` is off by default):
 
-```bash
-skill-scanner-pre-commit install
+```json
+{
+  "skills_path": ".claude/skills",
+  "policy": "low-noise",
+  "use_llm": true,
+  "llm_model": "anthropic/claude-sonnet-5-5",
+  "severity_threshold": "high",
+  "fail_fast": true
+}
 ```
 
-The hook only scans skill directories with staged changes. Use `--all` to scan everything.
+The hook scans only the skills a commit touches. The key comes from `SKILL_SCANNER_LLM_API_KEY`,
+or from cloud credentials for Bedrock and Vertex AI. `llm_model` and `llm_provider` fall back to
+`SKILL_SCANNER_LLM_MODEL` and `SKILL_SCANNER_LLM_PROVIDER`, so the hook can point at a local model.
+If the judge cannot be built, the commit is blocked with exit code 2 instead of passing on the rules
+alone. For a `bedrock/` model, add `additional_dependencies: [boto3]` to the hook. Run
+`pre-commit install` once, or `skill-scanner-pre-commit --install` without the pre-commit framework.
 
 ## Next Steps
 
@@ -237,14 +276,15 @@ The hook only scans skill directories with staged changes. Use `--all` to scan e
    - [/user-guide/scan-policies-overview](../user-guide/scan-policies-overview.md) - Custom policies and tuning
    - [/reference/](../reference/index.md) - Configuration, CLI, API, and output format reference
 
-2. **Try scanning your own skills:**
+2. **Pick a setup and scan your own skills:** see
+   [Recommended Settings](https://cisco-ai-defense.github.io/docs/skill-scanner/recommended-settings).
    ```bash
-   skill-scanner scan /path/to/your/skill
+   skill-scanner scan /path/to/your/skill --use-llm --policy low-noise --fail-on-severity high
    ```
 
 3. **Integrate with CI/CD:**
    ```bash
-   skill-scanner scan-all ./skills --fail-on-severity high
+   skill-scanner scan-all ./skills --recursive --use-llm --policy low-noise --fail-on-severity high
    # Exit code 1 if findings at or above HIGH severity
    ```
    See [GitHub Actions Integration](../github-actions.md) for a ready-made reusable workflow.

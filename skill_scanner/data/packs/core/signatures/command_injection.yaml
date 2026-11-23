@@ -25,6 +25,7 @@
   patterns:
     - "os\\.system\\s*\\([^)]*[f\"'].*\\{.*\\}"
     - "subprocess\\.(?:call|run|Popen)\\s*\\([^)]*[f\"'].*\\{.*\\}"
+    - "subprocess\\.(?:call|run|Popen)\\s*\\((?=[^)]*\\n)[^)]*[f\"'].*\\{.*\\}"
     - "os\\.popen\\s*\\([^)]*[f\"'].*\\{.*\\}"
   file_types: [python]
   description: "Shell command execution with string formatting (potential injection)"
@@ -35,7 +36,8 @@
   severity: HIGH
   patterns:
     - "subprocess\\.(?:call|run|Popen)\\s*\\([^)]*shell\\s*=\\s*True"
-    - "os\\.system\\s*\\("
+    - "subprocess\\.(?:call|run|Popen)\\s*\\((?=[^)]*\\n)[^)]*shell\\s*=\\s*True"
+    - "\\bos\\.system\\s*\\("
   file_types: [python]
   description: "Shell command execution with shell=True enabled"
   remediation: "Use shell=False and pass commands as lists"
@@ -54,7 +56,9 @@
     # Testing/example context
     - "example"
     - "test"
-    - "#.*eval"
+    # Anchored at the first '#' so a long run of '#' stays linear (an
+    # unanchored "#.*eval" is quadratic on a single long line).
+    - "^[^#]*#.*eval"
   file_types: [bash]
   description: "eval with user-controlled input - command injection risk"
   remediation: "Never use eval with user input. Use safer alternatives like case statements or parameter validation"
@@ -155,8 +159,11 @@
   exclude_patterns:
     # Common repository cleanup patterns (low-risk maintenance usage)
     - "find\\s+[^\\n]*-name\\s+[\"']?(?:__pycache__|\\.pytest_cache|\\.mypy_cache|\\.ruff_cache|\\.tox|node_modules|dist|build|\\.cache|\\.next|\\.nuxt|\\.egg-info|\\*\\.egg-info)[\"']?[^\\n]*-exec\\s+rm\\b"
-    # Time-based cleanup routines over temp/worktree directories
-    - "find\\s+[^\\n]*-mtime\\s+\\+[0-9]+[^\\n]*-exec\\s+rm\\b"
+    # Time-based cleanup routines over temp/worktree directories. -mmin is the minutes form of
+    # -mtime: "find ~/.gstack/sessions -mmin +120 -type f -exec rm {} +", a widely copied
+    # session-cleanup preamble, was 4,035 of this rule's flags on 1.88M real skills (the judge
+    # cleared 87%).
+    - "find\\s+[^\\n]*-(?:mtime|mmin|atime|amin|ctime|cmin)\\s+\\+[0-9]+[^\\n]*-exec\\s+rm\\b"
   file_types: [bash, markdown]
   description: "find command with -exec flag can execute arbitrary commands on discovered files"
   remediation: "Avoid find -exec with untrusted directories. Use explicit file lists instead"
@@ -165,8 +172,8 @@
   category: command_injection
   severity: CRITICAL
   patterns:
-    - "require\\s*\\(\\s*['\"]child_process['\"]\\s*\\)"
-    - "from\\s+['\"]child_process['\"]"
+    - "require\\s*\\(\\s*['\"](?:node:)?child_process['\"]\\s*\\)"
+    - "from\\s+['\"](?:node:)?child_process['\"]"
     - "child_process\\.(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\\s*\\("
     - "\\bexecSync\\s*\\("
     - "\\bspawnSync\\s*\\("
