@@ -55,7 +55,14 @@ skill-scanner scan /path/to/skill --use-llm --enable-meta --format json
 **Requirements:**
 - **Analyzer count**: CLI enforces at least 2 analyzers for meta-analysis (`_build_meta_analyzer` guard). API endpoints expose `enable_meta` and apply meta-analysis when findings exist; using multiple analyzers is still recommended for correlation quality.
 - **LLM credentials**: Configure `SKILL_SCANNER_META_LLM_API_KEY` / `SKILL_SCANNER_LLM_API_KEY`, or use a `bedrock/...` model with AWS credentials/IAM
-- **Recommended**: Use `--use-llm` with meta-analysis for best results, as LLM findings provide the semantic understanding the meta-analyzer relies on
+- **If you enable it**, pair it with `--use-llm`, as LLM findings provide the semantic understanding the meta-analyzer relies on
+
+> [!WARNING]
+> **Off by default, and we recommend keeping it off.** Measured on MaliciousSkillBench's held-out
+> split with Gemma 4 26B, the meta-analyzer cost 16.4 points of recall for 0.3 points of
+> false-positive rate. See [Measured results](../../reference/measured-results.md#the-meta-analyzer-is-off-by-default-and-should-stay-that-way).
+> To lower false positives, use a preset and the LLM caps instead
+> ([Recommended Settings](https://cisco-ai-defense.github.io/docs/skill-scanner/recommended-settings)).
 
 ## API Usage
 
@@ -86,17 +93,21 @@ The scanner uses `SKILL_SCANNER_*` environment variables exclusively (no provide
 **Scanner-wide settings** (apply to both LLM and Meta analyzers):
 ```bash
 export SKILL_SCANNER_LLM_API_KEY="your-api-key"
-export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-4-20250514"
+export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-5-5"
 export SKILL_SCANNER_LLM_BASE_URL="https://..."  # For Azure/custom endpoints
 export SKILL_SCANNER_LLM_API_VERSION="2025-01-01-preview"  # For Azure
+export SKILL_SCANNER_LLM_MAX_TOKENS="16384"  # Positive integer
+export SKILL_SCANNER_LLM_REASONING_EFFORT="low"
 ```
 
 **Meta-specific overrides** (optional - use different model/key for meta-analysis):
 ```bash
 export SKILL_SCANNER_META_LLM_API_KEY="different-key"
-export SKILL_SCANNER_META_LLM_MODEL="gpt-4o"
+export SKILL_SCANNER_META_LLM_MODEL="openai/<model>"
 export SKILL_SCANNER_META_LLM_BASE_URL="https://..."
 export SKILL_SCANNER_META_LLM_API_VERSION="..."
+export SKILL_SCANNER_META_LLM_MAX_TOKENS="32768"
+export SKILL_SCANNER_META_LLM_REASONING_EFFORT="minimal"
 ```
 
 ### Priority Order
@@ -107,20 +118,24 @@ export SKILL_SCANNER_META_LLM_API_VERSION="..."
 | Model | `SKILL_SCANNER_META_LLM_MODEL` → `SKILL_SCANNER_LLM_MODEL` → default |
 | Base URL | `SKILL_SCANNER_META_LLM_BASE_URL` → `SKILL_SCANNER_LLM_BASE_URL` |
 | API Version | `SKILL_SCANNER_META_LLM_API_VERSION` → `SKILL_SCANNER_LLM_API_VERSION` |
+| Max output tokens | CLI/API explicit value → `SKILL_SCANNER_META_LLM_MAX_TOKENS` → `SKILL_SCANNER_LLM_MAX_TOKENS` → policy/default |
+| Reasoning effort | CLI/API explicit value → `SKILL_SCANNER_META_LLM_REASONING_EFFORT` → `SKILL_SCANNER_LLM_REASONING_EFFORT` → provider default |
 
 ### Auth Behavior
 
 | Provider | Auth Method | Notes |
 |----------|-------------|-------|
 | Bedrock (`bedrock/...` model) | AWS credentials/IAM **or** API key | API key is optional when Bedrock auth is available |
-| Non-Bedrock models | `SKILL_SCANNER_META_LLM_API_KEY` or `SKILL_SCANNER_LLM_API_KEY` | Required by current meta-analyzer validation logic |
+| Ollama (`ollama/...` model) | None | Uses the local Ollama endpoint; no API key is required. Scanner requests disable the hidden thinking channel so the bounded output contains parseable JSON. |
+| Apple Foundation Models (`apple-fm/system`) | None | On-device. No API key. Install `apple-fm-sdk` (needs full Xcode) on macOS 26+ with Apple Intelligence. Semantic and meta scans only; behavioral alignment prompts exceed the on-device context window. |
+| Other models | `SKILL_SCANNER_META_LLM_API_KEY` or `SKILL_SCANNER_LLM_API_KEY` | Required for API-key-based providers |
 
 ### Setup Examples
 
 ```bash
 # Standard setup (one key for everything)
 export SKILL_SCANNER_LLM_API_KEY="sk-ant-..."
-export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-4-20250514"
+export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-5-5"
 
 # Azure OpenAI setup
 export SKILL_SCANNER_LLM_API_KEY="your-azure-key"
@@ -131,7 +146,7 @@ export SKILL_SCANNER_LLM_API_VERSION="2025-01-01-preview"
 # Separate meta key for second opinion (advanced)
 export SKILL_SCANNER_LLM_API_KEY="sk-ant-..."  # Primary: Claude
 export SKILL_SCANNER_META_LLM_API_KEY="sk-..."  # Meta: OpenAI
-export SKILL_SCANNER_META_LLM_MODEL="gpt-4o"
+export SKILL_SCANNER_META_LLM_MODEL="openai/<model>"
 ```
 
 ### Provider Examples
@@ -139,13 +154,13 @@ export SKILL_SCANNER_META_LLM_MODEL="gpt-4o"
 **Anthropic Claude:**
 ```bash
 export SKILL_SCANNER_LLM_API_KEY="sk-ant-..."
-export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-4-20250514"
+export SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-5-5"
 ```
 
 **OpenAI:**
 ```bash
 export SKILL_SCANNER_LLM_API_KEY="sk-..."
-export SKILL_SCANNER_LLM_MODEL="gpt-4o"
+export SKILL_SCANNER_LLM_MODEL="openai/<model>"
 ```
 
 **Azure OpenAI:**
@@ -159,12 +174,12 @@ export SKILL_SCANNER_LLM_API_VERSION="2025-01-01-preview"
 **Google Gemini:**
 ```bash
 export SKILL_SCANNER_LLM_API_KEY="your-gemini-key"
-export SKILL_SCANNER_LLM_MODEL="gemini/gemini-1.5-pro"
+export SKILL_SCANNER_LLM_MODEL="gemini/gemini-3.8-flash"
 ```
 
 **AWS Bedrock:**
 ```bash
-export SKILL_SCANNER_LLM_MODEL="bedrock/anthropic.claude-sonnet-4-20250514-v1:0"
+export SKILL_SCANNER_LLM_MODEL="bedrock/us.anthropic.claude-sonnet-5-5"
 # Optional if using bearer auth:
 export SKILL_SCANNER_LLM_API_KEY="bedrock-api-key-..."
 # Or use AWS credentials/profile/role:
@@ -220,6 +235,41 @@ Meta-analyzed findings include enriched metadata:
   }
 }
 ```
+
+### Overall Risk Assessment
+
+Each batch response also includes a skill-level assessment, surfaced in `scan_metadata.meta_risk_assessment`:
+
+```json
+{
+  "overall_risk_assessment": {
+    "risk_level": "HIGH",
+    "summary": "Skill exfiltrates AWS credentials to an external endpoint",
+    "top_priority": "Remove the network call in scripts/sync.py",
+    "skill_verdict": "MALICIOUS",
+    "verdict_reasoning": "Clear credential read → external POST chain with no legitimate use case"
+  }
+}
+```
+
+`risk_level` is one of `CRITICAL | HIGH | MEDIUM | LOW | SAFE`; `skill_verdict` is one of `SAFE | SUSPICIOUS | MALICIOUS`. Both are validated against these enums when a batch response is parsed. A differently-cased but otherwise valid value (`"safe"`) is normalized to its canonical uppercase form (`"SAFE"`); only a genuinely off-schema value (`"NONE"`) is collapsed to `"UNKNOWN"`, with the original string preserved under `raw_risk_level`/`raw_skill_verdict` for audit. `UNKNOWN` is reserved for the scanner's own degradation path (below) and is never accepted as a model-supplied verdict — a model that self-reports `"UNKNOWN"` is treated as off-schema and flagged the same way.
+
+When a skill's findings span multiple batches (see [Analyzer Selection Guide](meta-and-external-analyzers.md)), only the single highest-`risk_level` batch's assessment is kept as the skill-level result — other batches' `validated_findings`/`false_positives`/`correlations` are still merged in, but their risk assessments are discarded.
+
+`risk_level` and `skill_verdict` are force-set to `"UNKNOWN"` for the whole skill — regardless of what any individual batch concluded — the moment any batch logs an `analysis_warnings` entry, with the discarded values preserved under `partial_risk_level`/`partial_skill_verdict`. Four distinct situations produce that warning:
+
+| Situation | Where | What's retained |
+|---|---|---|
+| Response hits `max_tokens` and can't be narrowed further (single finding still truncates) | `_analyze_batch` | Batch's findings kept unchanged, `META_BATCH_TRUNCATED` |
+| Response isn't valid JSON after all extraction strategies | `_parse_response` | Batch's findings kept unchanged, `META_BATCH_PARSE_FAILED` |
+| Request fails outright (timeout, non-retryable error, retries exhausted) | `_analyze_batch` | Batch's findings kept unchanged, `META_BATCH_REQUEST_FAILED` |
+| Response *parses fine* but classifies an index invalidly, twice, or not at all | `_normalize_batch_result` | Missing/duplicate indices default to validated (conservative), `META_BATCH_INCOMPLETE` |
+
+The fourth case is the one to watch for: a batch can return syntactically valid JSON and still degrade the skill-level verdict to `UNKNOWN` if it simply fails to account for every finding it was given — no network or parsing failure required.
+
+`priority_order` is deliberately outside this set. It is a presentation-layer ranking rather than a classification, so a duplicated, incomplete, or out-of-batch entry is normalized in `_normalize_batch_result` — model order first, then any remaining validated indices in index order — and logged, never turned into an `analysis_warnings` entry. Rejecting the response over the ranking field would retain the entire batch unchanged, including the findings the model classified as false positives, and recording a warning for it would force the skill verdict to `UNKNOWN`; neither is warranted by a field that does not affect which findings are reported.
+
+Neither `risk_level` nor `skill_verdict` feed into `ScanResult.is_safe`, `max_severity`, or `--fail-on-severity` CI gating — they're reporting-layer signals read only by the Markdown and HTML reporters, which fall back to a severity-derived default when meta-analysis hasn't run.
 
 ### Finding Correlation
 

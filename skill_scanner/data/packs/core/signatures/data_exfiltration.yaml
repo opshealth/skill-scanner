@@ -37,13 +37,15 @@
   category: data_exfiltration
   severity: CRITICAL
   patterns:
-    - "socket\\.socket\\s*\\([^)]*\\)\\.connect"
-    - "socket\\.create_connection"
+    - "socket\\.socket\\s*\\([^)]*\\)\\.connect\\s*\\(\\s*(?![\\(\\[]\\s*['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"])"
+    - "socket\\.create_connection\\s*\\(\\s*(?![\\(\\[]\\s*['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"])"
+    # Resolver APIs issue external DNS lookups without an explicit socket connect.
+    - "socket\\.getaddrinfo\\s*\\((?!\\s*(?:['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"]|socket\\.gethostname\\s*\\(\\s*\\)))"
+    - "socket\\.gethostbyname_ex\\s*\\((?!\\s*(?:['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"]|socket\\.gethostname\\s*\\(\\s*\\)))"
+    - "socket\\.getnameinfo\\s*\\(\\s*(?![\\(\\[]\\s*['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"])"
+    - "socket\\.gethostbyname\\s*\\((?!\\s*(?:['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"]|socket\\.gethostname\\s*\\(\\s*\\)))"
+    - "socket\\.getfqdn\\s*\\((?!\\s*(?:(?:['\"](?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|::1)['\"]|socket\\.gethostname\\s*\\(\\s*\\))\\s*)?\\))"
   exclude_patterns:
-    - "localhost"
-    - "127\\.0\\.0\\.1"
-    - "0\\.0\\.0\\.0"
-    - "::1"
     - "def\\s+(is_)?.*ready"
     - "def\\s+.*health.*check"
     - "def\\s+.*wait.*server"
@@ -63,8 +65,7 @@
     - "(?:open|read)\\s*\\([^)]*\\.(?:gnupg|netrc|pgpass)"
     # .env file actually being opened (not just Path reference)
     - "open\\s*\\([^)]*\\.env(?:\\.[A-Za-z0-9_-]+)?['\"]\\s*[,)]"
-    # Variable names with clear sensitive-file intent being opened
-    - "(?:open|read)\\s*\\([^)]*\\b(?:cred(?:ential)?s?_path|secret(?:s)?_path|key(?:s)?_path|token(?:s)?_path)\\b"
+    # Constructed paths and aliases are resolved by the bounded Python AST pass.
   exclude_patterns:
     # Path references (not actual file access)
     - "Path\\s*\\([^)]*\\.env"
@@ -81,13 +82,35 @@
   description: "Opening sensitive system or credential files"
   remediation: "Do not read credential files or sensitive system files"
 
-# DATA_EXFIL_ENV_VARS - REMOVED
-# This rule was generating excessive false positives because:
-# - Reading secrets from environment variables is GOOD PRACTICE (not exfiltration)
-# - The pattern os.environ.get("API_KEY") is the recommended secure way to handle secrets
-# - This was flagging ~95% false positives in production
-# If you need to detect actual credential exfiltration, use the behavioral analyzer
-# which tracks data flow from env vars to network calls
+- id: DATA_EXFIL_ENV_VARS
+  category: data_exfiltration
+  severity: MEDIUM
+  patterns:
+    # Bulk snapshots expose every environment variable, unlike targeted reads.
+    - "\\bdict\\s*\\(\\s*os\\.environ\\s*\\)"
+    - "\\bvars\\s*\\(\\s*os\\.environ\\s*\\)"
+    - "\\bdict\\s*\\(\\s*\\*\\*\\s*os\\.environ\\s*\\)"
+    - "os\\.environ\\.copy\\s*\\("
+  file_types: [python]
+  description: "Bulk process environment snapshot can expose credentials and tokens"
+  remediation: "Read only the specific environment variables required by the skill; never snapshot the full environment"
+
+- id: DATA_EXFIL_ENV_DUMP
+  category: data_exfiltration
+  severity: HIGH
+  patterns:
+    # This rule is implemented by the language-aware scanner for
+    # DATA_EXFIL_ENV_DUMP in core/rules/patterns.py.  These representative
+    # patterns keep the YAML self-describing for pack readers.
+    - "print\\s*\\([^\\n]*(?:dict\\s*\\(\\s*)?os\\.environ"
+    - "json\\.dump(?:s)?\\s*\\(\\s*(?:dict\\s*\\(\\s*)?os\\.environ"
+    - "for\\s+\\w+\\s*,\\s*\\w+\\s+in\\s+os\\.environ\\s*(?:\\.\\s*items\\s*\\(\\s*\\))?\\s*:"
+    - "(?:^|[;&|]\\s*)(?:env|printenv|export[ \\t]+-p|declare[ \\t]+-x|set)[ \\t]*(?:$|[#;|>]|>>)"
+    - "JSON\\.stringify\\s*\\(\\s*process\\.env\\b"
+    - "Object\\.entries\\s*\\(\\s*process\\.env\\b"
+  file_types: [python, bash, javascript, typescript]
+  description: "Outputs, serialises, or transmits whole-environment values; targeted reads, keys-only enumeration, and local snapshots remain below this HIGH boundary"
+  remediation: "Read only the specific environment variables the skill needs; never print, serialise, pipe, redirect, or transmit the full process environment"
 
 - id: DATA_EXFIL_BASE64_AND_NETWORK
   category: data_exfiltration
@@ -125,7 +148,7 @@
 
 - id: DATA_EXFIL_JS_FS_ACCESS
   category: data_exfiltration
-  severity: HIGH
+  severity: LOW
   patterns:
     # Focus on actual file content read/write; exclude readdir/readdirSync
     # (directory listing is very common in Node.js and rarely exfiltrates data)
@@ -137,5 +160,5 @@
     - "(?i)test"
     - "//.*fs\\."
   file_types: [javascript, typescript]
-  description: "Node.js filesystem access that could read or write sensitive data"
-  remediation: "Review filesystem operations. Ensure they don't access sensitive system files or credential stores"
+  description: "Node.js filesystem access candidate for sensitive-flow correlation"
+  remediation: "Review filesystem operations and correlate sensitive sources with outbound sinks"

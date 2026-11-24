@@ -23,7 +23,7 @@ and blocks commits that contain HIGH or CRITICAL severity findings.
 
 Usage:
     1. Install as a pre-commit hook:
-       skill-scanner-pre-commit install
+       skill-scanner-pre-commit --install
 
     2. Or add to .pre-commit-config.yaml:
        - repo: local
@@ -32,8 +32,8 @@ Usage:
              name: Skill Scanner
              entry: skill-scanner-pre-commit
              language: python
-             types: [file]
              pass_filenames: false
+             always_run: true
 
 Configuration:
     Create a .skill_scannerrc file in your repo root:
@@ -41,15 +41,26 @@ Configuration:
     {
         "severity_threshold": "high",  # block on: critical, high, medium, low
         "skills_path": ".claude/skills",
+        "policy": "low-noise",
+        "use_llm": true,               # run the LLM judge (recommended)
+        "llm_model": "claude-sonnet-5-5",  # optional; falls back to SKILL_SCANNER_LLM_MODEL
+        "llm_provider": "anthropic",   # optional; falls back to SKILL_SCANNER_LLM_PROVIDER
         "fail_fast": true
     }
+
+    With ``use_llm`` set, the key comes from SKILL_SCANNER_LLM_API_KEY (or cloud
+    credentials for Bedrock and Vertex). A judge that cannot be built blocks the
+    commit with exit code 2 rather than falling back to the rules alone.
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+from ..core.changed_skills import resolve_affected_skills
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -58,7 +69,14 @@ DEFAULT_CONFIG = {
     "fail_fast": True,
     "use_behavioral": False,
     "use_trigger": True,
+    "use_llm": False,
+    "llm_model": None,  # falls back to SKILL_SCANNER_LLM_MODEL
+    "llm_provider": None,  # falls back to SKILL_SCANNER_LLM_PROVIDER
 }
+
+# Exit code when the hook cannot run as configured (for example, ``use_llm`` with
+# no usable model or key), matching the scanner CLI.
+EXIT_CONFIGURATION_ERROR = 2
 
 # Severity levels (higher number = more severe)
 SEVERITY_LEVELS = {
@@ -92,7 +110,7 @@ def load_config(repo_root: Path) -> dict:
     for config_path in config_paths:
         if config_path.exists():
             try:
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     user_config = json.load(f)
                     config.update(user_config)
                     break
@@ -111,58 +129,61 @@ def get_staged_files() -> list[str]:
     """
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
+            ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTD"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return [f.strip() for f in result.stdout.split("\n") if f.strip()]
+        return [path for path in result.stdout.split("\0") if path]
     except subprocess.CalledProcessError:
         return []
 
 
-def get_affected_skills(staged_files: list[str], skills_path: str) -> set[Path]:
+def get_ref_changed_files(from_ref: str, to_ref: str) -> list[str]:
+    """Get changed paths between two revisions, including deleted files."""
+    changed_files: list[str] = []
+    comparison = f"{from_ref}...{to_ref}"
+    for diff_filter in ("ACMRT", "D"):
+        result = subprocess.run(
+            ["git", "diff", f"--diff-filter={diff_filter}", "--name-only", "-z", comparison],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        changed_files.extend(path for path in result.stdout.split("\0") if path)
+
+    return list(dict.fromkeys(changed_files))
+
+
+def get_affected_skills(
+    changed_files: list[str],
+    skills_path: str,
+    *,
+    repo_root: str | Path | None = None,
+    skill_file: str = "SKILL.md",
+) -> set[Path]:
     """
-    Identify skill directories affected by staged changes.
+    Identify skill directories affected by changed files.
 
     Walks up from each staged file to find the nearest parent containing a
     SKILL.md.  Also honours the configured ``skills_path`` prefix so that
     changes inside a known skills tree are always detected.
 
     Args:
-        staged_files: List of staged file paths
+        changed_files: File paths supplied by pre-commit or discovered from the index
         skills_path: Base path for skills
+        repo_root: Optional repository boundary and base for relative paths
+        skill_file: Metadata filename used to identify a skill root
 
     Returns:
         Set of affected skill directory paths
     """
-    affected_skills: set[Path] = set()
-    skills_prefix = skills_path.rstrip("/") + "/"
-
-    for file_path in staged_files:
-        # 1. Check if file is in the configured skills directory
-        if file_path.startswith(skills_prefix) or file_path.startswith(skills_path):
-            relative = file_path[len(skills_path) :].lstrip("/")
-            parts = relative.split("/")
-
-            if parts:
-                skill_dir = Path(skills_path) / parts[0]
-                skill_md = skill_dir / "SKILL.md"
-                if skill_md.exists():
-                    affected_skills.add(skill_dir)
-
-        # 2. Walk up from the staged file to locate the nearest SKILL.md
-        candidate = Path(file_path).parent
-        while str(candidate) not in ("", "."):
-            if (candidate / "SKILL.md").exists():
-                affected_skills.add(candidate)
-                break
-            parent = candidate.parent
-            if parent == candidate:
-                break
-            candidate = parent
-
-    return affected_skills
+    return resolve_affected_skills(
+        changed_files,
+        repo_root=repo_root,
+        skill_roots=(skills_path,),
+        skill_file=skill_file,
+    )
 
 
 def scan_skill(skill_dir: Path, config: dict) -> dict:
@@ -176,6 +197,8 @@ def scan_skill(skill_dir: Path, config: dict) -> dict:
     Returns:
         Scan results as dictionary
     """
+    from ..core.analyzer_factory import AnalyzerConfigurationError
+
     try:
         from ..core.analyzer_factory import build_analyzers
         from ..core.scan_policy import ScanPolicy
@@ -183,7 +206,7 @@ def scan_skill(skill_dir: Path, config: dict) -> dict:
 
         # Load policy (preset name, file path, or default)
         policy_value = config.get("policy")
-        if policy_value and policy_value in ("strict", "balanced", "permissive"):
+        if policy_value and policy_value in ScanPolicy.preset_names():
             policy = ScanPolicy.from_preset(policy_value)
         elif policy_value:
             policy = ScanPolicy.from_yaml(policy_value)
@@ -195,10 +218,13 @@ def scan_skill(skill_dir: Path, config: dict) -> dict:
             policy,
             use_behavioral=bool(config.get("use_behavioral")),
             use_trigger=bool(config.get("use_trigger")),
+            use_llm=bool(config.get("use_llm")),
+            llm_model=config.get("llm_model") or None,
+            llm_provider=config.get("llm_provider") or None,
         )
 
-        scanner = SkillScanner(analyzers=analyzers, policy=policy)
-        result = scanner.scan_skill(skill_dir, lenient=bool(config.get("lenient")))
+        with SkillScanner(analyzers=analyzers, policy=policy) as scanner:
+            result = scanner.scan_skill(skill_dir, lenient=bool(config.get("lenient")))
 
         # Count findings by severity
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
@@ -227,6 +253,10 @@ def scan_skill(skill_dir: Path, config: dict) -> dict:
             "low_count": counts["low"],
         }
 
+    except AnalyzerConfigurationError:
+        # A requested analyzer that cannot be built is a configuration error for
+        # the whole run, not a per-skill scan failure to skip past.
+        raise
     except Exception as e:
         return {
             "skill_name": skill_dir.name,
@@ -290,9 +320,15 @@ def main(args: list[str] | None = None) -> int:
         help="Override skills path from config",
     )
     parser.add_argument(
-        "--all",
+        "--scan-all",
         action="store_true",
+        dest="scan_all",
         help="Scan all skills, not just staged ones",
+    )
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Install the built-in pre-commit hook",
     )
     parser.add_argument(
         "--lenient",
@@ -300,15 +336,16 @@ def main(args: list[str] | None = None) -> int:
         help="Tolerate malformed skills instead of failing",
     )
     parser.add_argument(
-        "install",
-        nargs="?",
-        help="Install pre-commit hook",
+        "filenames",
+        nargs="*",
+        metavar="FILE",
+        help="Changed files supplied by pre-commit (falls back to staged files when omitted)",
     )
 
     parsed_args = parser.parse_args(args)
 
-    # Handle install command
-    if parsed_args.install == "install":
+    # Installation is explicit so a changed path named ``install`` remains a filename.
+    if parsed_args.install:
         return install_hook()
 
     # Find repo root
@@ -336,21 +373,39 @@ def main(args: list[str] | None = None) -> int:
         config["lenient"] = True
 
     # Get staged files and affected skills
-    if parsed_args.all:
+    if parsed_args.scan_all:
         skills_dir = repo_root / config["skills_path"]
         if skills_dir.exists():
             affected_skills = {d for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()}
         else:
             affected_skills = set()
     else:
-        staged_files = get_staged_files()
-        affected_skills = get_affected_skills(staged_files, config["skills_path"])
+        changed_files = list(parsed_args.filenames)
+        from_ref = os.environ.get("PRE_COMMIT_FROM_REF")
+        to_ref = os.environ.get("PRE_COMMIT_TO_REF")
+        if from_ref and to_ref:
+            try:
+                changed_files.extend(get_ref_changed_files(from_ref, to_ref))
+            except subprocess.CalledProcessError as exc:
+                detail = exc.stderr.strip() if exc.stderr else str(exc)
+                print(f"Error: Failed to discover changed files: {detail}", file=sys.stderr)
+                return 1
+            changed_files = list(dict.fromkeys(changed_files))
+        elif not changed_files:
+            changed_files = get_staged_files()
+        affected_skills = get_affected_skills(
+            changed_files,
+            config["skills_path"],
+            repo_root=repo_root,
+        )
 
     if not affected_skills:
         # No skills affected, allow commit
         return 0
 
     print(f"Scanning {len(affected_skills)} skill(s)...")
+
+    from ..core.analyzer_factory import AnalyzerConfigurationError
 
     # Scan each affected skill
     blocked = False
@@ -359,7 +414,11 @@ def main(args: list[str] | None = None) -> int:
     for skill_dir in sorted(affected_skills):
         print(f"\n📦 {skill_dir.name}")
 
-        scan_result: dict = scan_skill(skill_dir, config)
+        try:
+            scan_result: dict = scan_skill(skill_dir, config)
+        except AnalyzerConfigurationError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return EXIT_CONFIGURATION_ERROR
 
         if scan_result.get("error"):
             print(f"  ⚠️  Error: {scan_result['error']}", file=sys.stderr)

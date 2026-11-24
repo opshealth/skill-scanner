@@ -19,9 +19,12 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
+from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
 import pytest
+from markdown_it import MarkdownIt
 
 from skill_scanner.core.models import Finding, Report, ScanResult, Severity, ThreatCategory
 from skill_scanner.core.reporters.json_reporter import JSONReporter
@@ -239,3 +242,394 @@ def test_sarif_reporter_multi_skill_github_compat(report: Report):
     for result in results:
         assert "locations" in result
         assert "fixes" not in result
+
+
+def _suppressed_result() -> ScanResult:
+    hidden = Finding(
+        id="FIND-004",
+        rule_id="HOMOGLYPH_ATTACK",
+        category=ThreatCategory.OBFUSCATION,
+        severity=Severity.HIGH,
+        title="Mixed-script text",
+        description="Non-ASCII prose read as obfuscation.",
+        file_path="docs/guide.md",
+        analyzer="static",
+        metadata={"suppression": {"rule_id": "HOMOGLYPH_ATTACK", "reason": "Cyrillic prose", "matched_skill": "docs"}},
+    )
+    return ScanResult(
+        skill_name="docs",
+        skill_directory="/tmp/docs",
+        findings=_sample_findings(),
+        suppressed_findings=[hidden],
+        timestamp=datetime(2026, 1, 2, 3, 4, 5),
+    )
+
+
+def test_sarif_reporter_marks_policy_suppressed_findings():
+    data = json.loads(SARIFReporter().generate_report(_suppressed_result()))
+
+    results = data["runs"][0]["results"]
+    suppressed = [r for r in results if "suppressions" in r]
+    assert len(suppressed) == 1
+    assert suppressed[0]["ruleId"] == "HOMOGLYPH_ATTACK"
+    assert suppressed[0]["suppressions"] == [{"kind": "external", "justification": "Cyrillic prose"}]
+
+    # The rule definition must travel with it, or the ruleId dangles.
+    assert "HOMOGLYPH_ATTACK" in {rule["id"] for rule in data["runs"][0]["tool"]["driver"]["rules"]}
+    assert all("suppressions" not in r for r in results if r["ruleId"] != "HOMOGLYPH_ATTACK")
+
+
+def test_sarif_reporter_builds_a_fallback_justification_from_the_selector():
+    result = _suppressed_result()
+    result.suppressed_findings[0].metadata["suppression"]["reason"] = ""
+
+    data = json.loads(SARIFReporter().generate_report(result))
+    suppressed = next(item for item in data["runs"][0]["results"] if "suppressions" in item)
+
+    assert suppressed["suppressions"][0]["justification"] == "Suppressed by scan policy (selector: docs)"
+
+
+def test_sarif_reporter_emits_no_suppressions_by_default(scan_result: ScanResult):
+    data = json.loads(SARIFReporter().generate_report(scan_result))
+    assert all("suppressions" not in result for result in data["runs"][0]["results"])
+
+
+def test_json_reporter_omits_suppressed_findings_when_none(scan_result: ScanResult):
+    data = json.loads(JSONReporter().generate_report(scan_result))
+    assert "suppressed_findings" not in data
+
+
+def test_json_reporter_includes_suppressed_findings_when_present():
+    data = json.loads(JSONReporter().generate_report(_suppressed_result()))
+    assert [f["rule_id"] for f in data["suppressed_findings"]] == ["HOMOGLYPH_ATTACK"]
+    # Suppressed findings must not inflate the reported count.
+    assert data["findings_count"] == len(data["findings"])
+
+
+def test_single_skill_text_reports_include_the_suppressed_count():
+    result = _suppressed_result()
+
+    markdown = MarkdownReporter().generate_report(result)
+    table = TableReporter(format_style="plain").generate_report(result)
+
+    assert "- **Suppressed by policy:** 1" in markdown
+    row = next(line for line in table.splitlines() if line.startswith("Suppressed by Policy"))
+    assert row.split()[-1] == "1"
+
+
+def _result_uris(sarif_output: str) -> list[str]:
+    data = json.loads(sarif_output)
+    return [
+        result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for result in data["runs"][0]["results"]
+    ]
+
+
+def test_sarif_reporter_uri_includes_skill_subpath_inside_scan_root(tmp_path, monkeypatch):
+    """URIs must be scan-root-relative so GitHub ties results to PR files (issue #107)."""
+    monkeypatch.chdir(tmp_path)
+    skill_dir = tmp_path / "plugins" / "hello-world" / "skills" / "hello-world"
+
+    result = ScanResult(
+        skill_name="hello-world",
+        skill_directory=str(skill_dir),
+        findings=_sample_findings(),
+        scan_duration_seconds=0.1,
+        analyzers_used=["static"],
+        timestamp=datetime(2026, 1, 2, 3, 4, 5),
+    )
+
+    uris = _result_uris(SARIFReporter().generate_report(result))
+
+    prefix = "plugins/hello-world/skills/hello-world"
+    assert f"{prefix}/scripts/decoder.py" in uris
+    assert f"{prefix}/SKILL.md" in uris
+    for uri in uris:
+        assert ".." not in uri
+        assert "\\" not in uri
+
+
+def test_sarif_reporter_uri_in_report_is_prefixed_per_skill(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    first = ScanResult(
+        skill_name="alpha",
+        skill_directory=str(tmp_path / "skills" / "alpha"),
+        findings=[_sample_findings()[2]],  # SKILL.md finding
+        timestamp=datetime(2026, 1, 2, 3, 4, 5),
+    )
+    second = ScanResult(
+        skill_name="beta",
+        skill_directory=str(tmp_path / "skills" / "beta"),
+        findings=[_sample_findings()[2]],
+        timestamp=datetime(2026, 1, 2, 3, 5, 0),
+    )
+
+    aggregate = Report(timestamp=datetime(2026, 1, 2, 3, 6, 0))
+    aggregate.add_scan_result(first)
+    aggregate.add_scan_result(second)
+
+    uris = _result_uris(SARIFReporter().generate_report(aggregate))
+
+    assert "skills/alpha/SKILL.md" in uris
+    assert "skills/beta/SKILL.md" in uris
+
+
+def test_sarif_reporter_uri_unchanged_when_skill_outside_scan_root(scan_result: ScanResult):
+    """Skills outside the working directory keep skill-relative URIs (no ".." segments)."""
+    uris = _result_uris(SARIFReporter().generate_report(scan_result))
+
+    assert "SKILL.md" in uris
+    assert "scripts/decoder.py" in uris
+    for uri in uris:
+        assert ".." not in uri
+
+
+@pytest.mark.parametrize(
+    ("filename", "encoded"),
+    [
+        ("release notes.py", "release%20notes.py"),
+        ("helper#1.py", "helper%231.py"),
+        ("helper?draft.py", "helper%3Fdraft.py"),
+        ("literal%20name.py", "literal%2520name.py"),
+        ("文档.py", "%E6%96%87%E6%A1%A3.py"),
+    ],
+)
+def test_sarif_reporter_encodes_filename_characters(tmp_path, monkeypatch, filename, encoded):
+    monkeypatch.chdir(tmp_path)
+    finding = _sample_findings()[2]
+    finding.file_path = f"scripts/{filename}"
+    result = ScanResult(
+        skill_name="docs",
+        skill_directory=str(tmp_path / "skills" / "docs"),
+        findings=[finding],
+    )
+
+    output = SARIFReporter().generate_report(result)
+    uri = _result_uris(output)[0]
+
+    assert uri == f"skills/docs/scripts/{encoded}"
+    artifact = json.loads(output)["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert artifact["uriBaseId"] == "%SRCROOT%"
+    parsed = urlsplit(uri)
+    assert not parsed.query
+    assert not parsed.fragment
+    assert unquote(parsed.path) == f"skills/docs/scripts/{filename}"
+
+
+@pytest.mark.parametrize("in_skill_directory", [True, False])
+def test_sarif_reporter_preserves_surrogate_escaped_path_bytes(tmp_path, monkeypatch, in_skill_directory):
+    """Undecodable filesystem bytes must not prevent report generation."""
+    monkeypatch.chdir(tmp_path)
+    skill_name = "docs\udcff" if in_skill_directory else "docs"
+    filename = "helper.py" if in_skill_directory else "helper\udcff.py"
+    finding = _sample_findings()[2]
+    finding.file_path = f"scripts/{filename}"
+    result = ScanResult(
+        skill_name=skill_name,
+        skill_directory=str(tmp_path / "skills" / skill_name),
+        findings=[finding],
+    )
+
+    uri = _result_uris(SARIFReporter().generate_report(result))[0]
+
+    assert uri.isascii()
+    parsed = urlsplit(uri)
+    assert not parsed.query
+    assert not parsed.fragment
+    assert unquote_to_bytes(parsed.path) == os.fsencode(f"skills/{skill_name}/scripts/{filename}")
+
+
+@pytest.mark.parametrize("inside_scan_root", [True, False])
+def test_sarif_reporter_encodes_paths_inside_and_outside_scan_root(tmp_path, monkeypatch, inside_scan_root):
+    monkeypatch.chdir(tmp_path)
+    skill_dir = tmp_path / "skills" / "docs #1" if inside_scan_root else tmp_path.parent / "external"
+    finding = _sample_findings()[2]
+    finding.file_path = "scripts/release #1.py"
+    result = ScanResult(skill_name="docs", skill_directory=str(skill_dir), findings=[finding])
+
+    uri = _result_uris(SARIFReporter().generate_report(result))[0]
+
+    prefix = "skills/docs%20%231/" if inside_scan_root else ""
+    assert uri == prefix + "scripts/release%20%231.py"
+
+
+def test_sarif_reporter_encodes_default_manifest_path_in_aggregate_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    finding = _sample_findings()[2]
+    finding.file_path = None
+    report = Report()
+    report.add_scan_result(
+        ScanResult(skill_name="docs", skill_directory=str(tmp_path / "skills" / "docs #1"), findings=[finding])
+    )
+
+    assert _result_uris(SARIFReporter().generate_report(report)) == ["skills/docs%20%231/SKILL.md"]
+
+
+def test_sarif_reporter_encodes_cross_skill_finding_path():
+    finding = _sample_findings()[2]
+    finding.file_path = "skills/docs #1/SKILL.md"
+    report = Report(cross_skill_findings=[finding])
+
+    assert _result_uris(SARIFReporter().generate_report(report)) == ["skills/docs%20%231/SKILL.md"]
+
+
+@pytest.mark.parametrize("report_kind", ["single", "aggregate", "cross_skill"])
+def test_sarif_reporter_absolute_path_is_a_file_uri(tmp_path, report_kind):
+    """Absolute artifacts must be file URIs without a relative path base."""
+    finding = _sample_findings()[2]
+    finding.file_path = str(tmp_path / "release #1.py")
+    result = ScanResult(skill_name="docs", skill_directory=str(tmp_path), findings=[finding])
+    if report_kind == "single":
+        data = result
+    elif report_kind == "aggregate":
+        data = Report()
+        data.add_scan_result(result)
+    else:
+        data = Report(cross_skill_findings=[finding])
+
+    output = SARIFReporter().generate_report(data)
+    uri = _result_uris(output)[0]
+
+    assert uri == (tmp_path / "release #1.py").as_uri()
+    assert urlsplit(uri).scheme == "file"
+    assert not urlsplit(uri).fragment
+    artifact = json.loads(output)["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert "uriBaseId" not in artifact
+
+
+def _report_with_suppressions() -> Report:
+    """Two suppressed findings, so the count differs from every other column."""
+    suppressed = _suppressed_result()
+    second = Finding(
+        id="FIND-005",
+        rule_id="ARCHIVE_FILE_DETECTED",
+        category=ThreatCategory.POLICY_VIOLATION,
+        severity=Severity.MEDIUM,
+        title="Archive in skill",
+        description="Archives are expected here.",
+        file_path="fixtures/sample.zip",
+        analyzer="static",
+        metadata={"suppression": {"rule_id": "ARCHIVE_FILE_DETECTED", "reason": "Test fixtures"}},
+    )
+    suppressed.suppressed_findings.append(second)
+
+    aggregate = Report(timestamp=datetime(2026, 1, 2, 3, 6, 0))
+    aggregate.add_scan_result(suppressed)
+    aggregate.add_scan_result(
+        ScanResult(
+            skill_name="clean",
+            skill_directory="/tmp/clean",
+            findings=[],
+            timestamp=datetime(2026, 1, 2, 3, 5, 0),
+        )
+    )
+    return aggregate
+
+
+def test_markdown_multi_skill_reports_suppressed_counts():
+    output = MarkdownReporter().generate_report(_report_with_suppressions())
+    assert "- **Suppressed by policy:** 2" in output
+
+
+def test_table_multi_skill_reports_suppressed_counts():
+    report = _report_with_suppressions()
+    report.add_cross_skill_findings([_sample_findings()[0]])
+    output = TableReporter(format_style="plain").generate_report(report)
+
+    lines = output.splitlines()
+    summary_row = next(line for line in lines if line.startswith("Suppressed by Policy"))
+    assert summary_row.split()[-1] == "2"
+
+    # The fixture suppresses two findings so the count differs from every other
+    # number in the row; asserting the last column then cannot pass by matching
+    # a neighbouring one.
+    docs_row = next(line for line in lines if line.startswith("docs "))
+    clean_row = next(line for line in lines if line.startswith("clean "))
+    cross_skill_row = next(line for line in lines if line.startswith("[cross-skill] "))
+    assert docs_row.split()[-1] == "2"
+    assert clean_row.split()[-1] == "0"
+    assert cross_skill_row.split()[-1] == "0"
+
+
+def test_multi_skill_reports_unchanged_without_suppressions(report: Report):
+    assert "Suppressed" not in MarkdownReporter().generate_report(report)
+    assert "Suppressed" not in TableReporter().generate_report(report)
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+@pytest.mark.parametrize(
+    ("snippet", "expected_code", "expected_info"),
+    [
+        ('print("```")', 'print("```")', ""),
+        ('```python\nprint("payload")', '```python\nprint("payload")', ""),
+        ('print("payload")\n```', 'print("payload")\n```', ""),
+        ('````\nprint("payload")\n```', '````\nprint("payload")\n```', ""),
+        ('```python\nprint("payload")\n```', 'print("payload")', "python"),
+        ('~~~python\nprint("```")\n~~~', 'print("```")', "python"),
+        ('helper.py:\n```python\nprint("payload")\n```', 'print("payload")', "python"),
+        ('````\nprint("payload")\n`````', 'print("payload")', ""),
+    ],
+)
+def test_markdown_snippet_keeps_following_diagnostics_visible(
+    aggregate: bool, snippet: str, expected_code: str, expected_info: str
+):
+    findings = _sample_findings()
+    findings[0].snippet = snippet
+    findings[0].remediation = "Keep this remediation visible."
+    findings[1].snippet = None
+    result = ScanResult(skill_name="example", skill_directory=".", findings=findings)
+    data: ScanResult | Report = result
+    if aggregate:
+        data = Report()
+        data.add_scan_result(result)
+
+    tokens = MarkdownIt().parse(MarkdownReporter(detailed=True).generate_report(data))
+    code_blocks = [token for token in tokens if token.type == "fence"]
+    assert len(code_blocks) == 1
+    assert code_blocks[0].content == expected_code + "\n"
+    assert code_blocks[0].info == expected_info
+    assert any(
+        token.type == "inline" and token.content == "**Remediation:** Keep this remediation visible."
+        for token in tokens
+    )
+    assert any(token.type == "inline" and findings[1].title in token.content for token in tokens)
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "opening", "closing", "expected_code", "expected_info"),
+    [
+        (True, "  ~~~python", "~~~", '  ~~~python\nprint("payload")\n~~~', ""),
+        (False, "  ~~~python", "~~~", 'print("payload")', "python"),
+        (True, "  ```python", "```", '  ```python\nprint("payload")\n```', ""),
+        (False, "  ```python", "```", 'print("payload")', "python"),
+        (True, "~~~python", "  ~~~", '~~~python\nprint("payload")\n  ~~~', ""),
+        (False, "~~~python", "  ~~~", 'print("payload")', "python"),
+        (True, "```python", "  ```", '```python\nprint("payload")\n  ```', ""),
+        (False, "```python", "  ```", 'print("payload")', "python"),
+        (True, " ~~~python", " ~~~", 'print("payload")', "python"),
+        (True, " ```python", " ```", 'print("payload")', "python"),
+    ],
+)
+def test_markdown_indented_fences_keep_following_diagnostics_visible(
+    aggregate: bool, opening: str, closing: str, expected_code: str, expected_info: str
+):
+    findings = _sample_findings()
+    findings[0].snippet = f'{opening}\nprint("payload")\n{closing}'
+    findings[0].remediation = "Keep this remediation visible."
+    findings[1].snippet = None
+    result = ScanResult(skill_name="example", skill_directory=".", findings=findings)
+    data: ScanResult | Report = result
+    if aggregate:
+        data = Report()
+        data.add_scan_result(result)
+
+    tokens = MarkdownIt().parse(MarkdownReporter(detailed=True).generate_report(data))
+    code_blocks = [token for token in tokens if token.type == "fence"]
+    assert len(code_blocks) == 1
+    assert code_blocks[0].content == expected_code + "\n"
+    assert code_blocks[0].info == expected_info
+    assert any(
+        token.type == "inline" and token.content == "**Remediation:** Keep this remediation visible."
+        for token in tokens
+    )
+    assert any(token.type == "inline" and findings[1].title in token.content for token in tokens)

@@ -73,7 +73,7 @@ For deeper semantic analysis, add API keys as repository secrets:
 - name: Run scan with LLM
   env:
     SKILL_SCANNER_LLM_API_KEY: ${{ secrets.SKILL_SCANNER_LLM_API_KEY }}
-    SKILL_SCANNER_LLM_MODEL: anthropic/claude-sonnet-4-20250514
+    SKILL_SCANNER_LLM_MODEL: anthropic/claude-sonnet-5-5
   run: |
     skill-scanner scan-all ./skills \
       --recursive \
@@ -96,11 +96,33 @@ Add to your [`.pre-commit-config.yaml`](https://github.com/cisco-ai-defense/skil
 ```yaml
 repos:
   - repo: https://github.com/cisco-ai-defense/skill-scanner
-    rev: v1.0.0  # use latest version
+    rev: 2.3.2  # the latest release tag (no "v" prefix)
     hooks:
       - id: skill-scanner
-        args: ["--fail-on-findings"]
 ```
+
+Turn the judge on in `.skill_scannerrc` at the repository root (`use_llm` is off by default):
+
+```json
+{
+  "skills_path": ".claude/skills",
+  "policy": "low-noise",
+  "use_llm": true,
+  "llm_model": "anthropic/claude-sonnet-5-5",
+  "severity_threshold": "high",
+  "fail_fast": true
+}
+```
+
+The hook scans only the skills a commit touches. The key comes from `SKILL_SCANNER_LLM_API_KEY`,
+or from cloud credentials for Bedrock and Vertex AI. `llm_model` and `llm_provider` fall back to
+`SKILL_SCANNER_LLM_MODEL` and `SKILL_SCANNER_LLM_PROVIDER`, so the hook can point at a local model.
+If the judge cannot be built, the commit is blocked with exit code 2 instead of passing on the rules
+alone. For a `bedrock/` model, add `additional_dependencies: [boto3]` to the hook. Run
+`pre-commit install` once, or `skill-scanner-pre-commit --install` without the pre-commit framework.
+
+The hook accepts `--severity`, `--skills-path`, `--scan-all` and `--lenient` as `args`; settings in
+`.skill_scannerrc` cover the rest.
 
 ### Manual hook
 
@@ -112,12 +134,29 @@ chmod +x .git/hooks/pre-commit
 
 The hook entry point is `skill-scanner-pre-commit`, which is installed alongside the main CLI.
 
+### Incremental checks in CI
+
+There is no staged index to inspect after a CI checkout. Use pre-commit's
+revision comparison; the hook reads those revisions from pre-commit's
+environment and computes the changed paths internally:
+
+```bash
+pre-commit run skill-scanner \
+  --from-ref "$BASE_SHA" \
+  --to-ref "$HEAD_SHA"
+```
+
+The hook uses a separate deletion diff so removed paths are included, resolves
+each changed path to its nearest parent containing `SKILL.md`, and scans each
+affected skill once. Both revisions must be present locally; configure the
+checkout step to fetch enough history for the selected base and head SHAs.
+
 ## Policy-Aware CI
 
 Keep preset strategy explicit by workflow stage:
 
 - **Pull requests:** `balanced` or `strict` preset for fast feedback
-- **Nightly / security sweep:** `strict` + optional semantic analyzers (`--use-llm`, `--use-behavioral`)
+- **Manual security sweep:** `strict` + optional semantic analyzers (`--use-llm`, `--use-behavioral`)
 
 ## Build Gate
 

@@ -4,11 +4,13 @@
 """Tests for the ScanPolicy system."""
 
 import textwrap
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from skill_scanner.core.scan_policy import ScanPolicy
+from skill_scanner.core.suppressions import SuppressionConfigError
 
 
 class TestScanPolicyDefaults:
@@ -49,6 +51,8 @@ class TestScanPolicyDefaults:
         assert policy.pipeline.compound_fetch_filter_shell_wrapped_fetch is True
         assert "sudo" in policy.pipeline.compound_fetch_exec_prefixes
         assert "bash" in policy.pipeline.compound_fetch_exec_commands
+        assert "powershell" in policy.pipeline.compound_fetch_exec_commands
+        assert "pwsh" in policy.pipeline.compound_fetch_exec_commands
 
     def test_default_has_rule_scoping(self):
         policy = ScanPolicy.default()
@@ -169,6 +173,124 @@ class TestScanPolicyCustomisation:
         assert policy.get_severity_override("BINARY_FILE_DETECTED") == "MEDIUM"
         assert policy.get_severity_override("NONEXISTENT") is None
 
+    def test_scoped_suppressions(self, tmp_path):
+        policy_file = tmp_path / "scoped.yaml"
+        policy_file.write_text(
+            textwrap.dedent("""\
+            suppressions:
+              - rule_id: HOMOGLYPH_ATTACK
+                skills: ["docs-translator"]
+                reason: "Skill legitimately contains Cyrillic prose"
+                expires: 2030-12-31
+              - rule_id: ARCHIVE_FILE_DETECTED
+                paths: ["**/fixtures/**/*.zip"]
+                severity: LOW
+                reason: "Test fixtures"
+        """)
+        )
+        policy = ScanPolicy.from_yaml(policy_file)
+        assert [s.rule_id for s in policy.suppressions] == ["HOMOGLYPH_ATTACK", "ARCHIVE_FILE_DETECTED"]
+        assert policy.suppressions[0].skills == ("docs-translator",)
+        assert policy.suppressions[0].expires == date(2030, 12, 31)
+        assert policy.suppressions[1].paths == ("**/fixtures/**/*.zip",)
+        assert policy.suppressions[1].severity == "LOW"
+
+    def test_scoped_suppression_without_selector_is_rejected(self, tmp_path):
+        policy_file = tmp_path / "bad.yaml"
+        policy_file.write_text(
+            textwrap.dedent("""\
+            suppressions:
+              - rule_id: HOMOGLYPH_ATTACK
+                reason: "everywhere"
+        """)
+        )
+        with pytest.raises(SuppressionConfigError, match="no selector"):
+            ScanPolicy.from_yaml(policy_file)
+
+    def test_scoped_suppression_typo_is_rejected(self, tmp_path):
+        policy_file = tmp_path / "typo.yaml"
+        policy_file.write_text(
+            textwrap.dedent("""\
+            suppressions:
+              - rule_id: HOMOGLYPH_ATTACK
+                skill: ["docs-translator"]
+        """)
+        )
+        with pytest.raises(SuppressionConfigError, match="unknown key"):
+            ScanPolicy.from_yaml(policy_file)
+
+    def test_scoped_suppressions_replace_preset_entries(self):
+        """Use a non-empty base so replacement differs from concatenation."""
+        base = {"suppressions": [{"rule_id": "FROM_PRESET", "skills": ["*"]}]}
+        override = {"suppressions": [{"rule_id": "ONLY_THIS", "skills": ["alpha"]}]}
+
+        policy = ScanPolicy._from_dict(ScanPolicy._deep_merge(base, override))
+        assert [s.rule_id for s in policy.suppressions] == ["ONLY_THIS"]
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "hidden_files",
+            "pipeline",
+            "rule_scoping",
+            "credentials",
+            "system_cleanup",
+            "file_classification",
+            "file_limits",
+            "analysis_thresholds",
+            "sensitive_files",
+            "command_safety",
+            "analyzers",
+            "cel",
+            "adjudicator",
+            "llm_analysis",
+            "finding_output",
+            "severity_overrides",
+            "disabled_rules",
+            "suppressions",
+        ],
+    )
+    def test_section_present_with_no_value_loads_cleanly(self, tmp_path, key):
+        policy_file = tmp_path / "bare.yaml"
+        policy_file.write_text(f"{key}:\n")
+
+        policy = ScanPolicy.from_yaml(policy_file)
+        assert getattr(policy, key) is not None
+
+    @pytest.mark.parametrize(
+        ("yaml_body", "check"),
+        [
+            # A list under a nested key, all entries commented out.
+            ("hidden_files:\n  benign_dotfiles:\n    # - '.gitignore'\n", lambda p: p.hidden_files.benign_dotfiles),
+            # A scalar under a nested key.
+            ("file_limits:\n  max_file_count:\n", lambda p: p.file_limits.max_file_count == 100),
+            # A regex list two levels down.
+            ("rule_scoping:\n  doc_filename_patterns:\n", lambda p: p.rule_scoping.doc_filename_patterns is not None),
+        ],
+    )
+    def test_nested_key_present_with_no_value_falls_back_to_the_default(self, tmp_path, yaml_body, check):
+        policy_file = tmp_path / "nested.yaml"
+        policy_file.write_text(yaml_body)
+
+        assert check(ScanPolicy.from_yaml(policy_file))
+
+    def test_falsy_values_are_not_treated_as_absent(self, tmp_path):
+        policy_file = tmp_path / "falsy.yaml"
+        policy_file.write_text(
+            textwrap.dedent("""\
+            file_limits:
+              max_file_count: 0
+            pipeline:
+              demote_in_docs: false
+            disabled_rules: []
+        """)
+        )
+        policy = ScanPolicy.from_yaml(policy_file)
+
+        assert policy.file_limits.max_file_count == 0
+        assert policy.pipeline.demote_in_docs is False
+        assert policy.disabled_rules == set()
+
     def test_empty_policy_gets_all_defaults(self, tmp_path):
         """An empty override file should result in all defaults."""
         policy_file = tmp_path / "empty.yaml"
@@ -194,6 +316,25 @@ class TestScanPolicyRoundTrip:
         assert reloaded.pipeline.known_installer_domains == original.pipeline.known_installer_domains
         assert reloaded.rule_scoping.skillmd_and_scripts_only == original.rule_scoping.skillmd_and_scripts_only
         assert reloaded.credentials.known_test_values == original.credentials.known_test_values
+        assert reloaded.suppressions == original.suppressions
+
+    def test_suppressions_survive_roundtrip(self, tmp_path):
+        policy_file = tmp_path / "scoped.yaml"
+        policy_file.write_text(
+            textwrap.dedent("""\
+            suppressions:
+              - rule_id: HOMOGLYPH_ATTACK
+                skills: ["docs-*"]
+                paths: ["docs/**/*.md"]
+                severity: LOW
+                reason: "Reviewed"
+                expires: 2030-12-31
+        """)
+        )
+        original = ScanPolicy.from_yaml(policy_file)
+        out_path = tmp_path / "roundtrip.yaml"
+        original.to_yaml(out_path)
+        assert ScanPolicy.from_yaml(out_path).suppressions == original.suppressions
 
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
@@ -219,6 +360,19 @@ class TestScanPolicyPresets:
         with pytest.raises(ValueError, match="Unknown preset"):
             ScanPolicy.from_preset("nonexistent")
 
+    def test_presets_share_llm_context_budgets(self):
+        """A preset changes which findings are reported, not how much of the skill the LLM reads."""
+        budgets = {}
+        for name in ("strict", "balanced", "permissive", "low-noise", "quiet"):
+            llm = ScanPolicy.from_preset(name).llm_analysis
+            budgets[name] = (
+                llm.max_instruction_body_chars,
+                llm.max_code_file_chars,
+                llm.max_referenced_file_chars,
+                llm.max_total_prompt_chars,
+            )
+        assert len(set(budgets.values())) == 1, budgets
+
     def test_strict_has_fewer_benign_dotfiles(self):
         strict = ScanPolicy.from_preset("strict")
         balanced = ScanPolicy.from_preset("balanced")
@@ -233,6 +387,8 @@ class TestScanPolicyPresets:
         assert strict.pipeline.compound_fetch_filter_shell_wrapped_fetch is False
         assert "sudo" in strict.pipeline.compound_fetch_exec_prefixes
         assert "node" in strict.pipeline.compound_fetch_exec_commands
+        assert "powershell" in strict.pipeline.compound_fetch_exec_commands
+        assert "pwsh" in strict.pipeline.compound_fetch_exec_commands
 
     def test_strict_has_no_test_creds(self):
         strict = ScanPolicy.from_preset("strict")
@@ -270,6 +426,8 @@ class TestScanPolicyPresets:
         assert permissive.finding_output.annotate_same_path_rule_cooccurrence is True
         assert "sudo" in permissive.pipeline.compound_fetch_exec_prefixes
         assert "bash" in permissive.pipeline.compound_fetch_exec_commands
+        assert "powershell" in permissive.pipeline.compound_fetch_exec_commands
+        assert "pwsh" in permissive.pipeline.compound_fetch_exec_commands
         assert permissive.rule_scoping.asset_prompt_injection_skip_in_docs is True
         assert permissive.finding_output.dedupe_same_issue_per_location is True
 
@@ -318,7 +476,7 @@ class TestPolicySectionAnalyzerIntegration:
                 path=skillmd,
                 relative_path="SKILL.md",
                 file_type="markdown",
-                content=skillmd.read_text(),
+                content=skillmd.read_text(encoding="utf-8"),
                 size_bytes=skillmd.stat().st_size,
             ),
         ]

@@ -235,13 +235,13 @@ class TestTaxonomyHelpers:
 
     def test_get_aitech_name(self):
         """Test AITech name lookup."""
-        assert get_aitech_name("AITech-1.1") == "Direct Prompt Injection"
+        assert get_aitech_name("AITech-1.1") == "Direct Prompt Injection and Jailbreak (Prompt-based Manipulation)"
         assert get_aitech_name("AITech-8.2") == "Data Exfiltration / Exposure"
         assert get_aitech_name("AITech-99.99") is None
 
     def test_get_aisubtech_name(self):
         """Test AISubtech name lookup."""
-        assert get_aisubtech_name("AISubtech-1.1.1") == "Instruction Manipulation (Direct Prompt Injection)"
+        assert get_aisubtech_name("AISubtech-1.1.1") == "Instruction Manipulation"
         assert get_aisubtech_name("AISubtech-99.99.99") is None
 
 
@@ -278,7 +278,7 @@ class TestLLMAnalyzerTaxonomy:
             return []
 
         results = []
-        content = filepath.read_text()
+        content = filepath.read_text(encoding="utf-8")
 
         for line_num, line in enumerate(content.splitlines(), start=1):
             # Find AITech codes
@@ -330,7 +330,7 @@ class TestLLMAnalyzerTaxonomy:
         if not schema_path.exists():
             pytest.skip("LLM response schema not found")
 
-        schema = json.loads(schema_path.read_text())
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
         invalid_codes = []
 
         # Navigate to aitech enum in schema

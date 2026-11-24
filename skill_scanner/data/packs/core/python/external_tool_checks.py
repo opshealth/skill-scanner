@@ -13,6 +13,13 @@ import re
 from typing import TYPE_CHECKING
 
 from skill_scanner.core.models import Finding, Severity, ThreatCategory
+from skill_scanner.core.rules.ooxml_relationships import (
+    INCONCLUSIVE_MACRO_ANALYSIS,
+    VBA_MACRO,
+    XLM_MACRO,
+    classify_oleid_macro_indicator,
+)
+from skill_scanner.core.static_analysis.comment_stripping import comment_stripped_lines
 
 from ._helpers import generate_finding_id
 
@@ -171,6 +178,7 @@ def check_office_documents(skill: Skill, policy: ScanPolicy) -> list[Finding]:
             indicators = oid.check()
 
             has_macros = False
+            macro_analysis_incomplete = False
             is_encrypted = False
             suspicious_indicators: list[str] = []
 
@@ -178,12 +186,16 @@ def check_office_documents(skill: Skill, policy: ScanPolicy) -> list[Finding]:
                 ind_id = getattr(indicator, "id", "")
                 ind_value = getattr(indicator, "value", None)
 
-                if ind_id == "vba_macros" and ind_value:
+                macro_kind = classify_oleid_macro_indicator(ind_id, ind_value)
+                if macro_kind == VBA_MACRO:
                     has_macros = True
                     suspicious_indicators.append(f"VBA macros detected: {ind_value}")
-                elif ind_id == "xlm_macros" and ind_value:
+                elif macro_kind == XLM_MACRO:
                     has_macros = True
                     suspicious_indicators.append(f"XLM/Excel4 macros detected: {ind_value}")
+                elif macro_kind == INCONCLUSIVE_MACRO_ANALYSIS:
+                    macro_analysis_incomplete = True
+                    suspicious_indicators.append(f"Macro analysis was inconclusive: {ind_id}")
                 elif ind_id == "encrypted" and ind_value:
                     is_encrypted = True
                     suspicious_indicators.append(f"Document is encrypted: {ind_value}")
@@ -200,9 +212,13 @@ def check_office_documents(skill: Skill, policy: ScanPolicy) -> list[Finding]:
             if has_macros:
                 severity = Severity.CRITICAL
                 title = "Office document contains VBA macros"
-            elif is_encrypted:
+            elif is_encrypted or macro_analysis_incomplete:
                 severity = Severity.HIGH
-                title = "Office document is encrypted (resists analysis)"
+                title = (
+                    "Office macro analysis was incomplete"
+                    if macro_analysis_incomplete
+                    else "Office document is encrypted (resists analysis)"
+                )
             else:
                 severity = Severity.MEDIUM
                 title = "Office document contains suspicious indicators"
@@ -268,10 +284,12 @@ def check_homoglyph_attacks(skill: Skill, policy: ScanPolicy) -> list[Finding]:
             continue
 
         dangerous_lines: list[tuple[int, str, list[dict]]] = []
+        original_lines = content.split("\n")
+        analysis_lines = comment_stripped_lines(content, sf.file_type)
 
-        for line_num, line in enumerate(content.split("\n"), 1):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+        for line_num, (line, analysis_line) in enumerate(zip(original_lines, analysis_lines, strict=True), 1):
+            stripped = analysis_line.strip()
+            if not stripped or stripped.startswith("//"):
                 continue
             if stripped.isascii():
                 continue
@@ -280,7 +298,7 @@ def check_homoglyph_attacks(skill: Skill, policy: ScanPolicy) -> list[Finding]:
 
             result = confusables.is_dangerous(stripped, preferred_aliases=["LATIN"])
             if result:
-                dangerous_lines.append((line_num, stripped, result))
+                dangerous_lines.append((line_num, line.strip(), result))
 
         min_dangerous_lines = policy.analysis_thresholds.min_dangerous_lines
         if len(dangerous_lines) < min_dangerous_lines:

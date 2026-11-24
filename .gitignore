@@ -5,6 +5,8 @@ __pycache__/
 *.so
 .Python
 build/
+# Locally bootstrapped CEL helper; release wheels build a fresh verified copy.
+skill_scanner/core/cel/_bin/
 # Auto-generated version file (hatch-vcs)
 skill_scanner/_version.py
 develop-eggs/
@@ -12,8 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -102,5 +104,10 @@ Thumbs.db
 BENCHMARK_RESULTS.md
 evals/results/
 
+# UI test/verification scripts (local-only, require Playwright)
+scripts/ui_screenshot.py
+scripts/ui_security_verify.py
+
 # User-generated scan policy (default TUI output)
 scan_policy.yaml
+ISSUE_DRAFT.md

@@ -213,7 +213,7 @@ Tests run automatically in GitHub Actions on:
 - Every pull request
 
 The CI pipeline runs:
-1. Unit tests across Python 3.10, 3.11, 3.12
+1. Unit tests across Python 3.11, 3.12, 3.13, and 3.14
 2. Pre-commit checks (linting, formatting)
 3. Coverage reporting
 
@@ -247,6 +247,6 @@ uv run pytest tests/test_scanner.py::test_scan_safe_skill -v --forked
 
 ## Related Documentation
 
-- [Development Guide](/docs/developing.md) - Environment setup
+- [Development Guide](docs/development/setup-and-testing.md) - Environment setup
 - [Contributing Guide](/CONTRIBUTING.md) - Contribution process
 - [Evaluation Framework](/evals/README.md) - Detection accuracy testing

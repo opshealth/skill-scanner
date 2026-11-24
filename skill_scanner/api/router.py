@@ -30,22 +30,30 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 
 try:
     from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, UploadFile
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, model_validator
 
     MULTIPART_AVAILABLE = True
 except ImportError:
     raise ImportError("API server requires FastAPI. Install with: pip install fastapi uvicorn python-multipart")
 
 from .. import __version__ as PACKAGE_VERSION
-from ..core.analyzer_factory import build_analyzers
+from ..core.analyzer_factory import LLM_CONFIGURATION_HINT, AnalyzerConfigurationError, build_analyzers
+from ..core.cel.models import CelMode
+from ..core.cel.runtime import CelRuntimeUnavailable
+from ..core.exceptions import SkillLoadError
+from ..core.finding_taxonomy import refresh_taxonomy_scan_metadata
 from ..core.scan_policy import ScanPolicy
 from ..core.scanner import SkillScanner
+from ..llm_reasoning import LLMReasoningEffort, ReasoningConfigurationError
+from ..llm_token_options import resolve_llm_max_tokens
+from ..utils.file_utils import FileValidationError, resolve_path_within_root
+from ..utils.logging_context import scan_log_context
 
 logger = logging.getLogger("skill_scanner.api")
 
@@ -96,14 +104,20 @@ except (ImportError, ModuleNotFoundError):
 
 MetaAnalyzer: type | None
 apply_meta_analysis_to_results: Callable[..., list] | None
+merge_meta_analyzer_usage: Callable[..., None] | None
 try:
-    from ..core.analyzers.meta_analyzer import MetaAnalyzer, apply_meta_analysis_to_results
+    from ..core.analyzers.meta_analyzer import (
+        MetaAnalyzer,
+        apply_meta_analysis_to_results,
+        merge_meta_analyzer_usage,
+    )
 
     META_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     META_AVAILABLE = False
     MetaAnalyzer = None
     apply_meta_analysis_to_results = None
+    merge_meta_analyzer_usage = None
 
 router = APIRouter()
 
@@ -149,30 +163,85 @@ class _BoundedCache(OrderedDict[str, dict]):
 
 scan_results_cache = _BoundedCache()
 
+
+class _RulePackStartupConfigurationError(RuntimeError):
+    """The server's bundled rule generation failed startup validation."""
+
+
+_API_UPLOAD_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory(prefix="skill_scanner_api_")
+_API_UPLOAD_ROOT = Path(os.path.realpath(_API_UPLOAD_TEMPORARY_DIRECTORY.name))
+_API_UPLOAD_ROOT.chmod(0o700)
+
+
+def _api_allowed_roots() -> list[Path]:
+    """Return resolved filesystem roots exposed to remote callers.
+
+    Uploaded archives always use a process-private directory. Server-side
+    paths are inaccessible unless an operator explicitly adds their roots.
+    """
+
+    configured = [
+        Path(os.path.realpath(os.path.expanduser(value.strip())))
+        for value in os.environ.get("SKILL_SCANNER_ALLOWED_ROOTS", "").split(os.pathsep)
+        if value.strip()
+    ]
+    return list(dict.fromkeys((_API_UPLOAD_ROOT, *configured)))
+
+
 # Environment-configurable allowlist of directories the API may access.
-# When empty (default) any *resolved* absolute path is accepted — operators
-# should set SKILL_SCANNER_ALLOWED_ROOTS to restrict access in production.
-_ALLOWED_ROOTS: list[Path] = [
-    Path(p).resolve() for p in os.environ.get("SKILL_SCANNER_ALLOWED_ROOTS", "").split(":") if p.strip()
-]
+# It is deliberately never empty, but defaults only to server-owned uploads;
+# deployments scanning server-side libraries must opt those roots in through
+# SKILL_SCANNER_ALLOWED_ROOTS.
+_ALLOWED_ROOTS: list[Path] = _api_allowed_roots()
 
 
-def _validate_path(user_input: str, *, label: str = "path") -> Path:
+def _validate_path(
+    user_input: str,
+    *,
+    label: str = "path",
+    must_exist: bool = False,
+    expected_kind: str | None = None,
+) -> Path:
     """Sanitize and validate a user-supplied filesystem path.
 
     Rejects null bytes and path-traversal attempts, resolves symlinks, and
-    enforces the optional SKILL_SCANNER_ALLOWED_ROOTS allowlist.
+    enforces the SKILL_SCANNER_ALLOWED_ROOTS allowlist.  For endpoints that
+    require an existing path, disallowed paths are reported as missing so the
+    API does not disclose whether arbitrary host paths exist.
     """
+    if not user_input.strip():
+        raise HTTPException(status_code=400, detail=f"Invalid {label}: path must not be empty")
     if "\x00" in user_input:
         raise HTTPException(status_code=400, detail=f"Invalid {label}: null bytes are not allowed")
 
-    resolved = Path(user_input).resolve()
+    resolved: Path | None = None
+    matched_root: Path | None = None
+    for root in _ALLOWED_ROOTS:
+        try:
+            resolved = resolve_path_within_root(user_input, root=root, must_exist=False)
+        except FileValidationError:
+            continue
+        matched_root = root
+        break
 
-    if _ALLOWED_ROOTS and not any(resolved == root or resolved.is_relative_to(root) for root in _ALLOWED_ROOTS):
+    if resolved is None or matched_root is None:
+        if must_exist:
+            raise HTTPException(status_code=404, detail=f"{label} not found")
         raise HTTPException(
             status_code=403,
             detail=f"Access denied: {label} is outside the allowed directories",
         )
+
+    if must_exist:
+        try:
+            resolved = resolve_path_within_root(user_input, root=matched_root, must_exist=True)
+        except FileValidationError as exc:
+            raise HTTPException(status_code=404, detail=f"{label} not found") from exc
+
+    if expected_kind == "file" and not resolved.is_file():
+        raise HTTPException(status_code=400, detail=f"{label} must be a file")
+    if expected_kind == "directory" and not resolved.is_dir():
+        raise HTTPException(status_code=400, detail=f"{label} must be a directory")
 
     return resolved
 
@@ -182,25 +251,63 @@ def _validate_path(user_input: str, *, label: str = "path") -> Path:
 # ---------------------------------------------------------------------------
 
 
-class ScanRequest(BaseModel):
+class _RemoteScanConfig(BaseModel):
+    """Common validation for scan configuration accepted over the API."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_trusted_rule_pack_paths(cls, data: object) -> object:
+        """Keep trusted local rule packs behind a local administrator boundary."""
+        if isinstance(data, Mapping):
+            forbidden = {"trusted_rule_pack", "trusted_rule_packs"}.intersection(data)
+            if forbidden:
+                names = ", ".join(sorted(forbidden))
+                raise ValueError(
+                    f"{names} cannot be supplied over the remote API; "
+                    "trusted rule packs must be configured by the local service administrator"
+                )
+        return data
+
+
+class ScanRequest(_RemoteScanConfig):
     """Request model for scanning a skill."""
 
     skill_directory: str = Field(..., description="Path to skill directory")
     policy: str | None = Field(
         None,
-        description="Scan policy: preset name (strict, balanced, permissive) or path to custom YAML",
+        description=(
+            "Scan policy: a preset (balanced, low-noise, quiet, strict, permissive) or a path to custom "
+            "YAML. For fewer false positives use low-noise or quiet with use_llm; quiet requires the LLM judge"
+        ),
+    )
+    cel_mode: CelMode | None = Field(
+        None,
+        description="Optional CEL decision-mode override: off, shadow (observe only), or enforce",
     )
     custom_rules: str | None = Field(None, description="Path to custom YARA rules directory")
     use_llm: bool = Field(False, description="Enable LLM analyzer")
-    llm_provider: str | None = Field("anthropic", description="LLM provider (anthropic or openai)")
+    llm_provider: str | None = Field(
+        "anthropic",
+        description="LLM provider, for example anthropic, openai, openai-compatible, aws-bedrock or gcp-vertex",
+    )
     use_behavioral: bool = Field(False, description="Enable behavioral analyzer")
     use_virustotal: bool = Field(False, description="Enable VirusTotal binary file scanning")
     vt_upload_files: bool = Field(False, description="Upload unknown files to VirusTotal")
     use_aidefense: bool = Field(False, description="Enable AI Defense analyzer")
     aidefense_api_url: str | None = Field(None, description="AI Defense API URL")
     use_trigger: bool = Field(False, description="Enable trigger specificity analysis")
-    enable_meta: bool = Field(False, description="Enable meta-analysis for false positive filtering")
+    use_osv: bool = Field(False, description="Enable OSV.dev dependency vulnerability scanning")
+    enable_meta: bool = Field(False, description="Enable the meta-analyzer (off by default: measured to cost recall)")
     llm_consensus_runs: int = Field(1, description="Number of LLM consensus runs (majority vote)")
+    llm_max_tokens: int | None = Field(
+        None,
+        gt=0,
+        description="Maximum output tokens for LLM and meta-analysis responses",
+    )
+    llm_reasoning_effort: LLMReasoningEffort | None = Field(
+        None,
+        description="Optional LLM reasoning effort; unset preserves the provider default",
+    )
 
 
 class ScanResponse(BaseModel):
@@ -214,6 +321,11 @@ class ScanResponse(BaseModel):
     scan_duration_seconds: float
     timestamp: str
     findings: list[dict]
+    scan_metadata: dict[str, object] = Field(
+        default_factory=dict,
+        description="Scan provenance and decision-layer telemetry, including CEL mode and counters",
+    )
+    llm_usage: dict[str, int] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -224,13 +336,20 @@ class HealthResponse(BaseModel):
     analyzers_available: list[str]
 
 
-class BatchScanRequest(BaseModel):
+class BatchScanRequest(_RemoteScanConfig):
     """Request for batch scanning."""
 
     skills_directory: str
     policy: str | None = Field(
         None,
-        description="Scan policy: preset name (strict, balanced, permissive) or path to custom YAML",
+        description=(
+            "Scan policy: a preset (balanced, low-noise, quiet, strict, permissive) or a path to custom "
+            "YAML. For fewer false positives use low-noise or quiet with use_llm; quiet requires the LLM judge"
+        ),
+    )
+    cel_mode: CelMode | None = Field(
+        None,
+        description="Optional CEL decision-mode override: off, shadow (observe only), or enforce",
     )
     custom_rules: str | None = Field(None, description="Path to custom YARA rules directory")
     recursive: bool = False
@@ -243,8 +362,18 @@ class BatchScanRequest(BaseModel):
     use_aidefense: bool = False
     aidefense_api_url: str | None = None
     use_trigger: bool = False
+    use_osv: bool = False
     enable_meta: bool = Field(False, description="Enable meta-analysis")
     llm_consensus_runs: int = Field(1, description="Number of LLM consensus runs (majority vote)")
+    llm_max_tokens: int | None = Field(
+        None,
+        gt=0,
+        description="Maximum output tokens for LLM and meta-analysis responses",
+    )
+    llm_reasoning_effort: LLMReasoningEffort | None = Field(
+        None,
+        description="Optional LLM reasoning effort; unset preserves the provider default",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -252,21 +381,103 @@ class BatchScanRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_policy(policy_str: str | None) -> ScanPolicy:
-    """Resolve a policy string to a ScanPolicy object."""
+def _resolve_policy(policy_str: str | None, *, cel_mode: CelMode | str | None = None) -> ScanPolicy:
+    """Resolve a policy string and apply an optional API-level CEL override."""
     if policy_str is None or not policy_str.strip():
-        return ScanPolicy.default()
-    policy_str = policy_str.strip()
-    if policy_str.lower() in ("strict", "balanced", "permissive"):
-        return ScanPolicy.from_preset(policy_str)
-    policy_path = _validate_path(policy_str, label="policy path")
-    if policy_path.exists():
-        if not policy_path.is_file():
-            raise ValueError(f"Policy path '{policy_str}' is not a file.")
-        if policy_path.suffix not in (".yaml", ".yml"):
-            raise ValueError("Policy file must have a .yaml or .yml extension.")
-        return ScanPolicy.from_yaml(str(policy_path))
-    raise ValueError(f"Unknown policy '{policy_str}'. Use a preset name or a path to a YAML file.")
+        policy = ScanPolicy.default()
+    else:
+        policy_str = policy_str.strip()
+        if policy_str.lower() in ScanPolicy.preset_names():
+            policy = ScanPolicy.from_preset(policy_str)
+        else:
+            try:
+                policy_path = _validate_path(
+                    policy_str,
+                    label="policy path",
+                    must_exist=True,
+                    expected_kind="file",
+                )
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    raise ValueError(
+                        f"Unknown policy '{policy_str}'. Use a preset name or a path to a YAML file."
+                    ) from exc
+                raise ValueError(str(exc.detail)) from exc
+            if policy_path.suffix not in (".yaml", ".yml"):
+                raise ValueError("Policy file must have a .yaml or .yml extension.")
+            policy = ScanPolicy.from_yaml(policy_path)
+
+    if cel_mode is not None:
+        policy.cel.mode = CelMode(cel_mode)
+    return policy
+
+
+def _resolve_request_policy(policy_str: str | None, cel_mode: CelMode | str | None) -> ScanPolicy:
+    """Resolve an API policy without passing a redundant override keyword.
+
+    Keeping the no-override path identical to the historical one-argument call is
+    useful for API embedders that wrap ``_resolve_policy`` for policy selection,
+    while an explicitly requested CEL mode still takes the strict override path.
+    """
+    if cel_mode is None:
+        return _resolve_policy(policy_str)
+    return _resolve_policy(policy_str, cel_mode=cel_mode)
+
+
+def _create_api_scanner(analyzers: list, policy: ScanPolicy | None) -> SkillScanner:
+    """Create an API scanner with a strictly validated bundled generation.
+
+    Remote callers cannot nominate trusted local pack paths, but active CEL
+    modes must still compile and evaluate gates shipped in bundled packs.
+    Validation is a startup invariant even when CEL is off; the pack loader
+    process-caches the installed immutable generation.
+    """
+    from ..core.rule_registry import PackLoader
+
+    try:
+        registry = PackLoader().build_registry()
+        return SkillScanner(analyzers=analyzers, policy=policy, rule_registry=registry)
+    except CelRuntimeUnavailable:
+        raise
+    except ValueError as exc:
+        # Rule parse/type/metadata failures are local service configuration
+        # errors, not malformed scan requests from the remote caller.
+        raise _RulePackStartupConfigurationError(f"Bundled rule-pack configuration failed: {exc}") from exc
+
+
+def _skill_load_error_detail(error: SkillLoadError, skill_dir: Path) -> str:
+    """Return client-safe validation detail for skill loading failures."""
+    detail = str(error).replace(str(skill_dir), "skill directory")
+    return f"Invalid skill package: {detail}"
+
+
+def _build_api_meta_analyzer(
+    policy: ScanPolicy,
+    *,
+    llm_max_tokens: int | None,
+    llm_provider: str | None,
+    llm_reasoning_effort: str | None,
+):
+    """Build the meta-analyzer a request asked for, or raise a configuration error."""
+    if not META_AVAILABLE or MetaAnalyzer is None or apply_meta_analysis_to_results is None:
+        raise AnalyzerConfigurationError("enable_meta needs the LLM dependencies: pip install litellm")
+    try:
+        return MetaAnalyzer(
+            policy=policy,
+            max_tokens=resolve_llm_max_tokens(
+                llm_max_tokens,
+                meta=True,
+                default=policy.llm_analysis.max_output_tokens if policy else 8192,
+            ),
+            provider=llm_provider,
+            reasoning_effort=llm_reasoning_effort,
+        )
+    except ReasoningConfigurationError:
+        raise
+    except Exception as e:
+        raise AnalyzerConfigurationError(
+            f"the meta-analyzer could not be initialised: {e}. {LLM_CONFIGURATION_HINT}"
+        ) from e
 
 
 def _build_analyzers(
@@ -283,7 +494,10 @@ def _build_analyzers(
     aidefense_api_key: str | None = None,
     aidefense_api_url: str | None = None,
     use_trigger: bool = False,
+    use_osv: bool = False,
     llm_consensus_runs: int = 1,
+    llm_max_tokens: int | None = None,
+    llm_reasoning_effort: str | None = None,
 ):
     """Build the analyzer list — delegates to the centralized factory."""
     return build_analyzers(
@@ -299,7 +513,10 @@ def _build_analyzers(
         aidefense_api_key=aidefense_api_key,
         aidefense_api_url=aidefense_api_url,
         use_trigger=use_trigger,
+        use_osv=use_osv,
         llm_consensus_runs=llm_consensus_runs,
+        llm_max_tokens=llm_max_tokens,
+        llm_reasoning_effort=llm_reasoning_effort,
     )
 
 
@@ -374,47 +591,69 @@ async def scan_skill(
     import asyncio
     import concurrent.futures
 
-    skill_dir = _validate_path(request.skill_directory, label="skill_directory")
-
-    if not skill_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Skill directory not found: {skill_dir}")
-
-    if not skill_dir.is_dir():
-        raise HTTPException(status_code=400, detail="skill_directory must be a directory")
+    skill_dir = _validate_path(
+        request.skill_directory,
+        label="skill_directory",
+        must_exist=True,
+        expected_kind="directory",
+    )
 
     if not (skill_dir / "SKILL.md").exists():
         raise HTTPException(status_code=400, detail="SKILL.md not found in directory")
 
     custom_rules_path: str | None = None
     if request.custom_rules:
-        validated_rules = _validate_path(request.custom_rules, label="custom_rules")
-        if not validated_rules.is_dir():
-            raise HTTPException(status_code=400, detail="custom_rules must be a directory")
+        validated_rules = _validate_path(
+            request.custom_rules,
+            label="custom_rules",
+            must_exist=True,
+            expected_kind="directory",
+        )
         custom_rules_path = str(validated_rules)
 
     try:
-        policy = _resolve_policy(request.policy)
+        policy = _resolve_request_policy(request.policy, request.cel_mode)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    scan_id = str(uuid.uuid4())
+
+    meta_analyzer = None
+    if request.enable_meta:
+        try:
+            meta_analyzer = _build_api_meta_analyzer(
+                policy,
+                llm_max_tokens=request.llm_max_tokens,
+                llm_provider=request.llm_provider,
+                llm_reasoning_effort=request.llm_reasoning_effort,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
     def run_scan():
-        analyzers = _build_analyzers(
-            policy,
-            custom_rules=custom_rules_path,
-            use_behavioral=request.use_behavioral,
-            use_llm=request.use_llm,
-            llm_provider=request.llm_provider,
-            use_virustotal=request.use_virustotal,
-            vt_api_key=vt_api_key,
-            vt_upload_files=request.vt_upload_files,
-            use_aidefense=request.use_aidefense,
-            aidefense_api_key=aidefense_api_key,
-            aidefense_api_url=request.aidefense_api_url,
-            use_trigger=request.use_trigger,
-            llm_consensus_runs=request.llm_consensus_runs,
-        )
-        scanner = SkillScanner(analyzers=analyzers, policy=policy)
-        return scanner.scan_skill(skill_dir)
+        # Context variables do not automatically cross executor boundaries,
+        # so bind the request id inside the worker thread itself.
+        with scan_log_context(scan_id=scan_id):
+            analyzers = _build_analyzers(
+                policy,
+                custom_rules=custom_rules_path,
+                use_behavioral=request.use_behavioral,
+                use_llm=request.use_llm,
+                llm_provider=request.llm_provider,
+                use_virustotal=request.use_virustotal,
+                vt_api_key=vt_api_key,
+                vt_upload_files=request.vt_upload_files,
+                use_aidefense=request.use_aidefense,
+                aidefense_api_key=aidefense_api_key,
+                aidefense_api_url=request.aidefense_api_url,
+                use_trigger=request.use_trigger,
+                use_osv=request.use_osv,
+                llm_consensus_runs=request.llm_consensus_runs,
+                llm_max_tokens=request.llm_max_tokens,
+                llm_reasoning_effort=request.llm_reasoning_effort,
+            )
+            with _create_api_scanner(analyzers, policy) as scanner:
+                return scanner.scan_skill(skill_dir)
 
     try:
         loop = asyncio.get_running_loop()
@@ -422,37 +661,39 @@ async def scan_skill(
             result = await loop.run_in_executor(executor, run_scan)
 
         # Meta-analysis
-        if (
-            request.enable_meta
-            and META_AVAILABLE
-            and MetaAnalyzer is not None
-            and apply_meta_analysis_to_results is not None
-            and len(result.findings) > 0
-        ):
-            try:
-                from ..core.loader import SkillLoader
+        if meta_analyzer is not None and apply_meta_analysis_to_results is not None and len(result.findings) > 0:
+            with scan_log_context(
+                skill_name=result.skill_name,
+                skill_path=str(skill_dir),
+                scan_id=scan_id,
+            ):
+                try:
+                    from ..core.loader import SkillLoader
 
-                meta_analyzer = MetaAnalyzer(policy=policy)
-                loader = SkillLoader()
-                skill = loader.load_skill(skill_dir)
+                    loader = SkillLoader()
+                    skill = loader.load_skill(skill_dir)
 
-                meta_result = await meta_analyzer.analyze_with_findings(
-                    skill=skill,
-                    findings=result.findings,
-                    analyzers_used=result.analyzers_used,
-                )
+                    meta_result = await meta_analyzer.analyze_with_findings(
+                        skill=skill,
+                        findings=result.findings,
+                        analyzers_used=result.analyzers_used,
+                    )
 
-                filtered_findings = apply_meta_analysis_to_results(
-                    original_findings=result.findings,
-                    meta_result=meta_result,
-                    skill=skill,
-                )
-                result.findings = filtered_findings
-                result.analyzers_used.append("meta_analyzer")
-            except Exception as meta_error:
-                logger.warning("Meta-analysis failed: %s", meta_error)
+                    filtered_findings = apply_meta_analysis_to_results(
+                        original_findings=result.findings,
+                        meta_result=meta_result,
+                        skill=skill,
+                    )
+                    result.findings = filtered_findings
+                    refresh_taxonomy_scan_metadata(result)
+                    result.analyzers_used.append("meta_analyzer")
+                    if merge_meta_analyzer_usage is not None:
+                        merge_meta_analyzer_usage(result, meta_analyzer)
+                except ReasoningConfigurationError:
+                    raise
+                except Exception as meta_error:
+                    logger.warning("Meta-analysis failed: %s", meta_error)
 
-        scan_id = str(uuid.uuid4())
         return ScanResponse(
             scan_id=scan_id,
             skill_name=result.skill_name,
@@ -462,8 +703,14 @@ async def scan_skill(
             scan_duration_seconds=result.scan_duration_seconds,
             timestamp=result.timestamp.isoformat(),
             findings=[f.to_dict() for f in result.findings],
+            scan_metadata=result.scan_metadata or {},
+            llm_usage=result.llm_usage,
         )
 
+    except (CelRuntimeUnavailable, _RulePackStartupConfigurationError) as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except SkillLoadError as e:
+        raise HTTPException(status_code=422, detail=_skill_load_error_detail(e, skill_dir)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -474,7 +721,18 @@ async def scan_skill(
 @router.post("/scan-upload")
 async def scan_uploaded_skill(
     file: UploadFile = File(..., description="ZIP file containing skill package"),
-    policy: str | None = Form(None, description="Scan policy: preset name or path to YAML"),
+    policy: str | None = Form(
+        None,
+        description="Scan policy: preset (balanced, low-noise, quiet, strict, permissive) or path to YAML",
+    ),
+    cel_mode: CelMode | None = Form(
+        None,
+        description="Optional CEL decision-mode override: off, shadow (observe only), or enforce",
+    ),
+    trusted_rule_packs: list[str] | None = Form(
+        None,
+        description="Unsupported over the API; trusted packs require local administrator configuration",
+    ),
     custom_rules: str | None = Form(None, description="Path to custom YARA rules directory"),
     use_llm: bool = Form(False, description="Enable LLM analyzer"),
     llm_provider: str = Form("anthropic", description="LLM provider"),
@@ -486,18 +744,44 @@ async def scan_uploaded_skill(
     aidefense_api_key: str | None = Header(None, alias="X-AIDefense-Key"),
     aidefense_api_url: str | None = Form(None, description="AI Defense API URL"),
     use_trigger: bool = Form(False, description="Enable trigger specificity analysis"),
-    enable_meta: bool = Form(False, description="Enable meta-analysis for FP filtering"),
+    use_osv: bool = Form(False, description="Enable OSV.dev dependency vulnerability scanning"),
+    enable_meta: bool = Form(False, description="Enable the meta-analyzer (off by default: measured to cost recall)"),
     llm_consensus_runs: int = Form(1, description="Number of LLM consensus runs"),
+    llm_max_tokens: int | None = Form(
+        None,
+        gt=0,
+        description="Maximum output tokens for LLM and meta-analysis responses",
+    ),
+    llm_reasoning_effort: LLMReasoningEffort | None = Form(
+        None,
+        description="Optional LLM reasoning effort; unset preserves the provider default",
+    ),
 ):
     """Scan an uploaded skill package (ZIP file)."""
+    if trusted_rule_packs is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "trusted_rule_packs cannot be supplied over the remote API; "
+                "trusted rule packs must be configured by the local service administrator"
+            ),
+        )
+
     if not file.filename or not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="File must be a ZIP archive")
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="skill_scanner_"))
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix="request_",
+            dir=str(_API_UPLOAD_ROOT),
+        )
+    )
 
     try:
         # Stream upload with size limit to avoid memory exhaustion
-        zip_path = temp_dir / file.filename
+        # The multipart filename is display metadata, not a filesystem path.
+        # A fixed server-owned name prevents absolute/relative path injection.
+        zip_path = temp_dir / "upload.zip"
         total_read = 0
         chunk_size = 1024 * 1024  # 1 MB chunks
         with open(zip_path, "wb") as f:
@@ -565,11 +849,24 @@ async def scan_uploaded_skill(
         if not skill_dirs:
             raise HTTPException(status_code=400, detail="No SKILL.md found in uploaded archive")
 
-        skill_dir = skill_dirs[0].parent
+        # A SKILL.md nested inside another skill's directory is part of that
+        # skill; independent roots are separate skills this endpoint cannot
+        # report on together, so refuse rather than scan one and call it safe.
+        all_roots = sorted({p.parent for p in skill_dirs})
+        skill_roots = [d for d in all_roots if not any(o != d and d.is_relative_to(o) for o in all_roots)]
+        if len(skill_roots) > 1:
+            names = ", ".join(sorted(d.relative_to(extracted_dir).as_posix() for d in skill_roots))
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Archive contains {len(skill_roots)} separate skills ({names}); upload one skill per archive"),
+            )
+
+        skill_dir = skill_roots[0]
 
         request = ScanRequest(
             skill_directory=str(skill_dir),
             policy=policy,
+            cel_mode=cel_mode,
             custom_rules=custom_rules,
             use_llm=use_llm,
             llm_provider=llm_provider,
@@ -579,8 +876,11 @@ async def scan_uploaded_skill(
             use_aidefense=use_aidefense,
             aidefense_api_url=aidefense_api_url,
             use_trigger=use_trigger,
+            use_osv=use_osv,
             enable_meta=enable_meta,
             llm_consensus_runs=llm_consensus_runs,
+            llm_max_tokens=llm_max_tokens,
+            llm_reasoning_effort=llm_reasoning_effort,
         )
 
         return await scan_skill(request, vt_api_key=vt_api_key, aidefense_api_key=aidefense_api_key)
@@ -597,13 +897,12 @@ async def scan_batch(
     aidefense_api_key: str | None = Header(None, alias="X-AIDefense-Key"),
 ):
     """Scan multiple skills in a directory (batch scan)."""
-    skills_dir = _validate_path(request.skills_directory, label="skills_directory")
-
-    if not skills_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Skills directory not found: {skills_dir}")
-
-    if not skills_dir.is_dir():
-        raise HTTPException(status_code=400, detail="skills_directory must be a directory")
+    skills_dir = _validate_path(
+        request.skills_directory,
+        label="skills_directory",
+        must_exist=True,
+        expected_kind="directory",
+    )
 
     scan_id = str(uuid.uuid4())
     scan_results_cache.set(scan_id, {"status": "processing", "started_at": datetime.now().isoformat(), "result": None})
@@ -645,12 +944,31 @@ def run_batch_scan(
     aidefense_api_key: str | None = None,
 ):
     """Background task to run batch scan."""
+    with scan_log_context(scan_id=scan_id):
+        _run_batch_scan(scan_id, request, vt_api_key, aidefense_api_key)
+
+
+def _run_batch_scan(
+    scan_id: str,
+    request: BatchScanRequest,
+    vt_api_key: str | None = None,
+    aidefense_api_key: str | None = None,
+):
+    """Run a batch scan with its request context already bound."""
+    scanner: SkillScanner | None = None
     try:
-        policy = _resolve_policy(request.policy)
+        policy = _resolve_request_policy(request.policy, request.cel_mode)
 
         custom_rules_path: str | None = None
         if request.custom_rules:
-            custom_rules_path = str(_validate_path(request.custom_rules, label="custom_rules"))
+            custom_rules_path = str(
+                _validate_path(
+                    request.custom_rules,
+                    label="custom_rules",
+                    must_exist=True,
+                    expected_kind="directory",
+                )
+            )
 
         analyzers = _build_analyzers(
             policy,
@@ -665,49 +983,69 @@ def run_batch_scan(
             aidefense_api_key=aidefense_api_key,
             aidefense_api_url=request.aidefense_api_url,
             use_trigger=request.use_trigger,
+            use_osv=request.use_osv,
             llm_consensus_runs=request.llm_consensus_runs,
+            llm_max_tokens=request.llm_max_tokens,
+            llm_reasoning_effort=request.llm_reasoning_effort,
         )
 
-        scanner = SkillScanner(analyzers=analyzers, policy=policy)
+        scanner = _create_api_scanner(analyzers, policy)
         report = scanner.scan_directory(
-            _validate_path(request.skills_directory, label="skills_directory"),
+            _validate_path(
+                request.skills_directory,
+                label="skills_directory",
+                must_exist=True,
+                expected_kind="directory",
+            ),
             recursive=request.recursive,
             check_overlap=request.check_overlap,
         )
 
         # Meta-analysis per skill
-        if (
-            request.enable_meta
-            and META_AVAILABLE
-            and MetaAnalyzer is not None
-            and apply_meta_analysis_to_results is not None
-        ):
+        if request.enable_meta:
             import asyncio
 
+            # Built before the per-skill loop so a configuration error fails the
+            # batch instead of being swallowed with the per-skill failures below.
+            meta_analyzer = _build_api_meta_analyzer(
+                policy,
+                llm_max_tokens=request.llm_max_tokens,
+                llm_provider=request.llm_provider,
+                llm_reasoning_effort=request.llm_reasoning_effort,
+            )
+
             async def _run_batch_meta(scanner_ref, report_ref, policy_ref):
-                meta_analyzer = MetaAnalyzer(policy=policy_ref)
                 for result in report_ref.scan_results:
                     if result.findings:
-                        try:
-                            skill_dir_path = Path(result.skill_directory)
-                            skill = scanner_ref.loader.load_skill(skill_dir_path)
-                            meta_result = await meta_analyzer.analyze_with_findings(
-                                skill=skill,
-                                findings=result.findings,
-                                analyzers_used=result.analyzers_used,
-                            )
-                            filtered_findings = apply_meta_analysis_to_results(
-                                original_findings=result.findings,
-                                meta_result=meta_result,
-                                skill=skill,
-                            )
-                            result.findings = filtered_findings
-                            result.analyzers_used.append("meta_analyzer")
-                        except Exception:
-                            pass
+                        skill_dir_path = Path(result.skill_directory)
+                        with scan_log_context(
+                            skill_name=result.skill_name,
+                            skill_path=str(skill_dir_path.resolve()),
+                        ):
+                            try:
+                                skill = scanner_ref.loader.load_skill(skill_dir_path)
+                                meta_result = await meta_analyzer.analyze_with_findings(
+                                    skill=skill,
+                                    findings=result.findings,
+                                    analyzers_used=result.analyzers_used,
+                                )
+                                filtered_findings = apply_meta_analysis_to_results(
+                                    original_findings=result.findings,
+                                    meta_result=meta_result,
+                                    skill=skill,
+                                )
+                                result.findings = filtered_findings
+                                refresh_taxonomy_scan_metadata(result)
+                                result.analyzers_used.append("meta_analyzer")
+                                if merge_meta_analyzer_usage is not None:
+                                    merge_meta_analyzer_usage(result, meta_analyzer)
+                            except Exception:
+                                pass
 
             try:
                 asyncio.run(_run_batch_meta(scanner, report, policy))
+            except ReasoningConfigurationError:
+                raise
             except Exception:
                 pass
 
@@ -736,6 +1074,9 @@ def run_batch_scan(
                 "error": str(e),
             },
         )
+    finally:
+        if scanner is not None:
+            scanner.close()
 
 
 @router.get("/analyzers")

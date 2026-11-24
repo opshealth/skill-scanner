@@ -20,6 +20,7 @@ jobs:
       - name: Start API Server
         run: |
           pip install cisco-ai-skill-scanner
+          export SKILL_SCANNER_ALLOWED_ROOTS="$GITHUB_WORKSPACE/skills"
           skill-scanner-api &
           sleep 5
 
@@ -27,7 +28,7 @@ jobs:
         run: |
           curl -X POST http://localhost:8000/scan-batch \
             -H "Content-Type: application/json" \
-            -d '{"skills_directory": "./skills"}' \
+            -d "{\"skills_directory\": \"$GITHUB_WORKSPACE/skills\"}" \
             > scan_id.json
 
           SCAN_ID=$(jq -r '.scan_id' scan_id.json)
@@ -77,7 +78,7 @@ CMD ["skill-scanner-api", "--host", "0.0.0.0", "--port", "8000"]
 docker build -t skill-scanner-api .
 docker run -p 8000:8000 \
   -e SKILL_SCANNER_LLM_API_KEY=your_key \
-  -e SKILL_SCANNER_LLM_MODEL=anthropic/claude-sonnet-4-20250514 \
+  -e SKILL_SCANNER_LLM_MODEL=anthropic/claude-sonnet-5-5 \
   skill-scanner-api
 ```
 
@@ -195,7 +196,7 @@ pip install -U cisco-ai-skill-scanner
 
 # Set model credentials
 export SKILL_SCANNER_LLM_API_KEY=your_key
-export SKILL_SCANNER_LLM_MODEL=anthropic/claude-sonnet-4-20250514
+export SKILL_SCANNER_LLM_MODEL=anthropic/claude-sonnet-5-5
 ```
 
 ### Slow performance
