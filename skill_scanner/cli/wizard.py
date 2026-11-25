@@ -53,7 +53,7 @@ _ACTIONS = {
 }
 
 _FORMATS = ["summary", "json", "markdown", "table", "sarif", "html"]
-_POLICIES = ["balanced", "strict", "permissive"]
+_POLICIES = ["balanced", "strict", "permissive", "low-noise", "quiet"]
 _SEVERITIES = ["none", "critical", "high", "medium", "low", "info"]
 
 _LOGO = r"""
@@ -300,6 +300,10 @@ def _ask_analyzers(env: dict) -> dict[str, bool]:
         "  Behavioral dataflow analysis",
         default=False,
     )
+    analyzers["use_osv"] = Confirm.ask(
+        "  OSV.dev dependency vulnerability scanning  [dim](requires network)[/]",
+        default=False,
+    )
 
     console.print()
     console.print("[bold]Requires API Key:[/]")
@@ -307,7 +311,7 @@ def _ask_analyzers(env: dict) -> dict[str, bool]:
     llm_set = env["keys"].get("SKILL_SCANNER_LLM_API_KEY", False)
     llm_tag = "[green]\u2714 key set[/]" if llm_set else "[dim]\u2718 key not set[/]"
     analyzers["use_llm"] = Confirm.ask(
-        f"  LLM semantic analysis  {llm_tag}",
+        f"  LLM judge (recommended: reads intent the rules cannot)  {llm_tag}",
         default=llm_set,
     )
 
@@ -331,8 +335,8 @@ def _ask_analyzers(env: dict) -> dict[str, bool]:
     meta_viable = active >= 2
     meta_hint = "" if meta_viable else "  [dim](enable 2+ analyzers first)[/]"
     analyzers["enable_meta"] = Confirm.ask(
-        f"  Meta-analysis false-positive filtering{meta_hint}",
-        default=meta_viable,
+        f"  Meta-analysis  [dim](off recommended: measured to cost recall)[/]{meta_hint}",
+        default=False,
     )
 
     return analyzers
@@ -349,28 +353,36 @@ def _ask_llm_details(env: dict) -> dict[str, str]:
 
     provider = Prompt.ask(
         "  LLM provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "openai", "openai-compatible", "aws-bedrock", "gcp-vertex", "azure-openai", "ollama"],
         default="anthropic",
     )
     details["llm_provider"] = provider
     return details
 
 
-def _ask_policy() -> str:
+def _ask_policy(use_llm: bool = True) -> str:
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Preset", style="bold", width=14)
     table.add_column("Description", style="dim")
-    table.add_row("[cyan]balanced[/]", "Recommended \u2014 good balance of coverage and noise")
-    table.add_row("[yellow]strict[/]", "Maximum detection \u2014 fewer false negatives")
-    table.add_row("[green]permissive[/]", "Minimal noise \u2014 fewer false positives")
+    table.add_row("[cyan]balanced[/]", "Default \u2014 with the LLM judge, the highest F1 measured")
+    table.add_row("[green]low-noise[/]", "Fewer false positives \u2014 use with the LLM judge")
+    table.add_row("[green]quiet[/]", "Fewest false positives \u2014 requires the LLM judge")
+    table.add_row("[yellow]strict[/]", "Maximum detection \u2014 for hunting, not for gating")
+    table.add_row("[dim]permissive[/]", "Fewer rules \u2014 not measured; prefer low-noise")
     console.print(table)
     console.print()
 
-    return Prompt.ask(
+    policy = Prompt.ask(
         "[bold]Policy preset[/]",
         choices=_POLICIES,
         default="balanced",
     )
+    if not use_llm and policy in {"low-noise", "quiet"}:
+        console.print(
+            f"[yellow]\u26a0  {policy} is measured with the LLM judge.[/] "
+            "Without it, the rules alone miss most malicious skills; enable the LLM judge."
+        )
+    return policy
 
 
 def _ask_format() -> str:
@@ -414,6 +426,43 @@ def _ask_lenient() -> bool:
     )
 
 
+def _ask_rule_packs() -> list[str]:
+    """Prompt the user to select additional rule packs (if any are available)."""
+    from ..data import list_available_packs
+
+    available = list_available_packs()
+    if not available:
+        console.print("[dim]No additional rule packs available (core rules are always loaded).[/]")
+        return []
+
+    console.print("[bold]Core rules are always loaded.[/]  Select additional rule packs:\n")
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="bold cyan", width=4)
+    table.add_column("Pack", style="bold")
+    for i, pack in enumerate(available, 1):
+        table.add_row(str(i), pack)
+    none_key = str(len(available) + 1)
+    table.add_row(none_key, "[dim]None (core only)[/]")
+    console.print(table)
+    console.print()
+
+    valid = [str(i) for i in range(1, len(available) + 2)]
+    choices_raw = Prompt.ask(
+        "[bold]Select packs[/] [dim](comma-separated numbers, or press Enter for none)[/]",
+        default=none_key,
+    )
+
+    selected: list[str] = []
+    for token in choices_raw.split(","):
+        token = token.strip()
+        if token in valid and token != none_key:
+            idx = int(token) - 1
+            if available[idx] not in selected:
+                selected.append(available[idx])
+
+    return selected
+
+
 # ── Command builder ──────────────────────────────────────────────────────────
 
 
@@ -426,6 +475,7 @@ def _build_command(
     analyzers: dict[str, bool] | None = None,
     llm_details: dict[str, str] | None = None,
     policy: str = "balanced",
+    rule_packs: list[str] | None = None,
     fmt: str = "summary",
     output_file: str | None = None,
     severity: str | None = None,
@@ -443,9 +493,15 @@ def _build_command(
     if policy != "balanced":
         cmd.extend(["--policy", policy])
 
+    if rule_packs:
+        cmd.append("--rule-packs")
+        cmd.extend(rule_packs)
+
     if analyzers:
         if analyzers.get("use_behavioral"):
             cmd.append("--use-behavioral")
+        if analyzers.get("use_osv"):
+            cmd.append("--use-osv")
         if analyzers.get("use_llm"):
             cmd.append("--use-llm")
         if analyzers.get("use_virustotal"):
@@ -534,7 +590,7 @@ def _execute_scan(cmd: list[str]) -> int:
 
 # ── Main wizard flow ─────────────────────────────────────────────────────────
 
-_SCAN_TOTAL_STEPS = 7
+_SCAN_TOTAL_STEPS = 8
 
 
 def run_wizard() -> int:
@@ -587,12 +643,19 @@ def run_wizard() -> int:
 
         # Step 4 — Policy
         _step_header(4, _SCAN_TOTAL_STEPS, "Policy")
-        policy = _ask_policy()
+        policy = _ask_policy(use_llm=bool(analyzers.get("use_llm")))
         preview_kw["policy"] = policy
         _print_preview(_build_partial_command(action, path, **preview_kw))
 
-        # Step 5 — Output
-        _step_header(5, _SCAN_TOTAL_STEPS, "Output")
+        # Step 5 — Rule Packs
+        _step_header(5, _SCAN_TOTAL_STEPS, "Rule Packs")
+        rule_packs = _ask_rule_packs()
+        if rule_packs:
+            preview_kw["rule_packs"] = rule_packs
+        _print_preview(_build_partial_command(action, path, **preview_kw))
+
+        # Step 6 — Output
+        _step_header(6, _SCAN_TOTAL_STEPS, "Output")
         fmt = _ask_format()
         output_file = _ask_output_file(fmt)
         preview_kw["fmt"] = fmt
@@ -600,15 +663,15 @@ def run_wizard() -> int:
             preview_kw["output_file"] = output_file
         _print_preview(_build_partial_command(action, path, **preview_kw))
 
-        # Step 6 — CI / Severity
-        _step_header(6, _SCAN_TOTAL_STEPS, "CI Gating")
+        # Step 7 — CI / Severity
+        _step_header(7, _SCAN_TOTAL_STEPS, "CI Gating")
         severity = _ask_severity()
         if severity:
             preview_kw["severity"] = severity
         _print_preview(_build_partial_command(action, path, **preview_kw))
 
-        # Step 7 — Extra Options
-        _step_header(7, _SCAN_TOTAL_STEPS, "Extra Options")
+        # Step 8 — Extra Options
+        _step_header(8, _SCAN_TOTAL_STEPS, "Extra Options")
         lenient = _ask_lenient()
         if lenient:
             preview_kw["lenient"] = lenient
@@ -621,6 +684,7 @@ def run_wizard() -> int:
             analyzers=analyzers,
             llm_details=llm_details,
             policy=policy,
+            rule_packs=rule_packs or None,
             fmt=fmt,
             output_file=output_file,
             severity=severity,
@@ -654,6 +718,7 @@ def run_wizard() -> int:
                     analyzers=analyzers,
                     llm_details=llm_details,
                     policy=policy,
+                    rule_packs=rule_packs or None,
                     fmt=fmt,
                     output_file=output_file,
                     severity=severity,

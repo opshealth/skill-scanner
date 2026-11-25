@@ -23,8 +23,10 @@ rule sql_injection_generic{
         $union_based_attacks = /(UNION\s+(ALL\s+)?SELECT|'\s*UNION\s+SELECT|"\s*UNION\s+SELECT)/i
 
         // Time-based blind injection techniques (SQL context only)
-        // Require SQL-specific context like quotes or semicolons
-        $time_based_injections = /['";]\s*(SLEEP|WAITFOR\s+DELAY|BENCHMARK|pg_sleep)\s*\(/i
+        // Generic sleep() counts only after a closing quote, the payload shape ('; SLEEP(5)).
+        // After a bare semicolon it is an ordinary statement in PHP, JS, k6, C..., so there
+        // only the SQL-specific delay functions count.
+        $time_based_injections = /(['"][ \t]*;?[ \t]*(SLEEP|WAITFOR\s+DELAY|BENCHMARK|pg_sleep)|;[ \t]*(WAITFOR\s+DELAY|BENCHMARK|pg_sleep))\s*\(/i
 
         // Exclude non-SQL sleep functions (Python, Rust, JS, etc.)
         $non_sql_sleep = /(time\.sleep|asyncio\.sleep|threading\.[A-Za-z]*\.sleep|tokio::time::sleep|std::thread::sleep|Thread\.sleep|setTimeout)\s*\(/
@@ -48,8 +50,8 @@ rule sql_injection_generic{
         $common_context_phrases = /\b(adds?\s+a\s+user|create\s+user|new\s+user|user\s+(account|profile|registration|authentication|permissions?|roles?)|user\s+(who|that)|for\s+user|the\s+user|current\s+user\s+(account|profile)|user\s+(input|data|information)|example:?\s+SELECT\s+USER\(\)|SELECT\s+USER\(\)\s+returns?|built-?in\s+function)\b/i
 
         // Documentation and code examples (legitimate SQL shown in docs)
-        $documentation_markers = /(```sql|```mysql|```postgres|-- Example|-- Query|SELECT\s+.*FROM\s+.*--\s*\w+\s+query|sample\s+query|example\s+query)/i
-        $schema_exploration = /\b(information_schema|pg_catalog|sys\.(schemas|tables|columns))\b.*\b(documentation|reference|schema|metadata)\b/i
+        $documentation_markers = /(```sql|```mysql|```postgres|-- Example|-- Query|SELECT\s+.{0,256}FROM\s+.{0,256}--\s*\w+\s+query|sample\s+query|example\s+query)/i
+        $schema_exploration = /\b(information_schema|pg_catalog|sys\.(schemas|tables|columns))\b.{0,256}\b(documentation|reference|schema|metadata)\b/i
 
     condition:
 

@@ -8,21 +8,33 @@ This page is a compact reference. For full walkthroughs, see [Custom Policy Conf
 
 ## Presets
 
-| Preset | Use case |
-|--------|----------|
-| **balanced** (default) | Good balance of detection and false-positive rate. Broad benign allowlists, demotion in docs, known installer domains trusted. |
-| **strict** | Lowest thresholds, most sensitive. Scans all files (no inert extension skip), no known installer demotions, narrow allowlists. Best for untrusted/external skills and compliance audits. |
-| **permissive** | Highest thresholds, fewer findings, broader whitelists. Best for trusted internal skills or high-FP workflows. |
+| Preset | CEL mode | Correlation | Use case |
+|--------|----------|-------------|----------|
+| **balanced** (default) | `shadow` | enabled | Good balance of detection and false-positive rate. Broad benign allowlists, demotion in docs, known installer domains trusted. |
+| **strict** | `shadow` | enabled | Lowest thresholds, most sensitive. Scans all files (no inert extension skip), no known installer demotions, narrow allowlists. Best for untrusted/external skills and compliance audits. |
+| **permissive** | `off` | disabled | Highest thresholds, fewer findings, broader whitelists. Not measured as a gate; prefer `low-noise` for fewer false positives. |
+| **low-noise** | `shadow` | enabled | `balanced` with 11 rules reported at LOW and LLM findings the model rates low-confidence capped at LOW. Your own skills, and the judge with a smaller review queue. |
+| **quiet** | `shadow` | enabled | `low-noise` plus 8 more demotions and a LOW cap on `CONTEXTUAL_RISK` LLM findings. Lowest false-positive rate, **only with `--use-llm`**. |
+
+Measured recall, false-positive rate and F1 for each preset, with and without the judge, are in
+[Recommended Settings](https://cisco-ai-defense.github.io/docs/skill-scanner/recommended-settings).
 
 ```bash
-skill-scanner scan --policy balanced ./my-skill
-skill-scanner scan --policy strict ./my-skill
-skill-scanner scan --policy /path/to/custom.yaml ./my-skill
+skill-scanner scan --use-llm --policy balanced ./my-skill
+skill-scanner scan --use-llm --policy low-noise ./my-skill
+skill-scanner scan --use-llm --policy quiet ./my-skill
+skill-scanner scan --use-llm --policy /path/to/custom.yaml ./my-skill
+skill-scanner scan --use-llm --policy balanced --cel-mode shadow ./my-skill
 skill-scanner generate-policy -o my_org_policy.yaml
 skill-scanner configure-policy  # Interactive TUI
 ```
 
-Use `--preset strict|balanced|permissive` with `generate-policy` to base a new file on a specific preset.
+Use `--preset strict|balanced|permissive|low-noise|quiet` with `generate-policy` to base a new file on a specific preset.
+
+All bundled CEL rules currently use `rollout: shadow`; a global `enforce` mode
+therefore remains non-suppressing until individual rules pass promotion. ATR is
+an optional `--rule-packs atr` input and does not gate the current core + CEL
+release.
 
 ## Most Common Tweaks
 
@@ -32,10 +44,13 @@ Copy-paste these into your policy YAML. You only need the sections you want to c
 
 ```yaml
 # Strict scanning for CI pipelines
+cel:
+  mode: shadow
 analyzers:
   static: true
   bytecode: true
   pipeline: true
+  correlation: true
 disabled_rules: []
 ```
 
@@ -55,6 +70,18 @@ disabled_rules:
   - ARCHIVE_FILE_DETECTED
   - MANIFEST_DESCRIPTION_TOO_LONG
 ```
+
+### Silence a rule for one skill only
+
+```yaml
+suppressions:
+  - rule_id: HOMOGLYPH_ATTACK
+    skills: ["docs-translator"]
+    reason: "Skill legitimately contains Cyrillic prose"
+```
+
+The rule keeps firing on every other skill. Use this instead of widening
+`disabled_rules` when only one skill produces the false positive.
 
 ### Override a rule severity
 
@@ -110,6 +137,19 @@ Each section below documents every field, its type, default, and what it affects
 | max_name_length | int | 64 | MANIFEST_INVALID_NAME |
 | max_description_length | int | 1024 | MANIFEST_DESCRIPTION_TOO_LONG |
 | min_description_length | int | 20 | SOCIAL_ENG_VAGUE_DESCRIPTION |
+
+</details>
+
+<details>
+<summary><strong>cel</strong> — Typed contextual decision layer</summary>
+
+| Field | Type | Default | Affects |
+|-------|------|---------|---------|
+| mode | `off` \| `shadow` \| `enforce` | `shadow` | Whether CEL decisions are skipped, observed, or allowed to suppress individually promoted rules |
+
+CEL expressions still compile and type-check in `off` mode. Runtime/projection
+errors fail open and retain the candidate. The CLI `--cel-mode` flag overrides
+this field for the current invocation.
 
 </details>
 
@@ -245,16 +285,19 @@ When a pipeline reads a matching file, the taint is upgraded to SENSITIVE_DATA.
 <details>
 <summary><strong>llm_analysis</strong> — LLM context budget thresholds</summary>
 
-Controls LLM context budget thresholds for LLM and meta analyzers. Content within budget is sent in full; content exceeding the budget is skipped entirely and an `LLM_CONTEXT_BUDGET_EXCEEDED` INFO finding is emitted.
+Controls LLM context budgets for the LLM and meta analyzers, and caps on the judge's weakest findings. Content within budget is sent in full. Code files that exceed a limit may contribute bounded excerpts containing executable lines, imports, or high-risk calls; the rest of the file is not analyzed and an `LLM_CONTEXT_BUDGET_EXCEEDED` INFO finding describes the partial analysis. An oversized instruction body is reduced to its beginning and end, with the omission marked; oversized referenced files remain skipped entirely.
 
 | Field | Type | Default | Affects |
 |-------|------|---------|---------|
 | max_instruction_body_chars | int | 20000 | Maximum character length for a single instruction body sent to the LLM |
-| max_code_file_chars | int | 15000 | Maximum character length for a single code file sent to the LLM |
+| max_code_file_chars | int | 15000 | Threshold for full inclusion and maximum excerpt size; `0` excludes directly formatted code-file contents. Referenced files use `max_referenced_file_chars` and may still be included within that limit |
 | max_referenced_file_chars | int | 10000 | Maximum character length for a single referenced file sent to the LLM |
 | max_total_prompt_chars | int | 100000 | Maximum total characters across the entire LLM prompt |
 | max_output_tokens | int | 8192 | Maximum output tokens for LLM responses (both LLM analyzer and meta-analyzer) |
 | meta_budget_multiplier | float | 3.0 | Multiplier applied to all input limits above for the meta analyzer (e.g. 3x = 60K instruction, 45K/file, 300K total) |
+| low_confidence_max_severity | str | `""` | Cap for LLM findings the model rates LOW confidence (e.g. `LOW`); on in `low-noise` and `quiet` |
+| contextual_risk_max_severity | str | `""` | Cap for LLM findings labelled `CONTEXTUAL_RISK` (e.g. `LOW`); on in `quiet` |
+| trusted_reference_domains | list | `[]` | Organization-controlled domains; LLM transitive-trust and supply-chain findings referencing only these are demoted to LOW |
 
 </details>
 
@@ -311,5 +354,33 @@ disabled_rules:
   - LAZY_LOAD_DEEP_NESTING
   - ARCHIVE_FILE_DETECTED
 ```
+
+</details>
+
+<details>
+<summary><strong>suppressions</strong> — Silence or re-rate a rule for named skills or paths</summary>
+
+| Field | Type | Default | Affects |
+|-------|------|---------|---------|
+| rule_id | str | required | The rule the entry applies to |
+| skills | list[str] | `[]` | Globs matched against the skill name |
+| paths | list[str] | `[]` | Globs matched against the skill-relative file path |
+| reason | str | `""` | Justification, surfaced in JSON and SARIF |
+| severity | str | none | Raise or lower the finding to this severity instead of suppressing it |
+| expires | date | none | `YYYY-MM-DD`; the entry is inert afterwards |
+
+```yaml
+suppressions:
+  - rule_id: ARCHIVE_FILE_DETECTED
+    paths: ["**/fixtures/**/*.zip"]
+    reason: "Test fixtures"
+    expires: 2030-12-31
+```
+
+At least one selector is required; when both are given, both must match. `*`
+does not cross a `/` — use `**` for any depth. Suppressed findings leave
+`findings` (so verdicts and exit codes ignore them) but remain visible as
+`suppressed_findings` and as SARIF suppressions. Cross-skill findings are out of
+scope.
 
 </details>

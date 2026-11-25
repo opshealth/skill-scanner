@@ -172,7 +172,7 @@ class TestLLMAnalyzerFailureSignal:
         assert len(failure_findings) == 1
         assert failure_findings[0].severity == Severity.INFO
         assert "connection refused" in failure_findings[0].description
-        assert failure_findings[0].analyzer == "llm_analyzer"
+        assert failure_findings[0].analyzer == "llm"
         assert analyzer.last_error == "connection refused"
 
     @pytest.mark.asyncio
@@ -187,7 +187,14 @@ class TestLLMAnalyzerFailureSignal:
             analyzer.request_handler,
             "make_request",
             new_callable=AsyncMock,
-            return_value=json.dumps({"findings": [], "overall_assessment": "Safe", "primary_threats": []}),
+            return_value=json.dumps(
+                {
+                    "findings": [],
+                    "overall_assessment": "Safe",
+                    "verdict": "SAFE",
+                    "primary_threats": [],
+                }
+            ),
         ):
             await analyzer.analyze_async(skill)
 
@@ -302,8 +309,117 @@ class TestMultipleFormats:
         _write_output(args, primary_output)
 
         assert Path(sarif_path).exists()
-        sarif_content = json.loads(Path(sarif_path).read_text())
+        sarif_content = json.loads(Path(sarif_path).read_text(encoding="utf-8"))
         assert sarif_content.get("$schema") or sarif_content.get("version")
+
+    def test_write_output_primary_format_uses_output_fmt_fallback(self, tmp_path):
+        """Primary format falls back to --output-<fmt> when --output is not set."""
+        from skill_scanner.cli.cli import _format_single, _write_output
+
+        result = ScanResult(
+            skill_name="s",
+            skill_directory="/tmp/s",
+            findings=[_mk_finding("1")],
+        )
+
+        md_path = str(tmp_path / "report.md")
+        json_path = str(tmp_path / "report.json")
+        args = argparse.Namespace(
+            format=["markdown", "json"],
+            output=None,
+            output_json=json_path,
+            output_sarif=None,
+            output_markdown=md_path,
+            output_html=None,
+            output_table=None,
+            compact=False,
+            detailed=False,
+            _result_or_report=result,
+        )
+
+        primary_output = _format_single("markdown", args, result)
+        _write_output(args, primary_output)
+
+        # Primary (markdown) should go to --output-markdown file, not stdout
+        assert Path(md_path).exists()
+        assert len(Path(md_path).read_text(encoding="utf-8")) > 0
+        # Secondary (json) should also go to its file
+        assert Path(json_path).exists()
+        json_content = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        assert isinstance(json_content, (dict, list))
+
+    def test_should_render_markdown_can_be_forced(self):
+        """--render-markdown should override a non-TTY stdout check."""
+        from skill_scanner.cli.cli import _should_render_markdown
+
+        args = argparse.Namespace(render_markdown=True, no_render_markdown=False)
+        with patch("skill_scanner.cli.cli.sys.stdout.isatty", return_value=False):
+            assert _should_render_markdown(args) is True
+
+    def test_write_output_renders_markdown_when_forced(self):
+        """Forced markdown rendering should use Rich instead of raw print."""
+        from skill_scanner.cli.cli import _write_output
+
+        args = argparse.Namespace(
+            format=["markdown"],
+            output=None,
+            output_json=None,
+            output_sarif=None,
+            output_markdown=None,
+            output_html=None,
+            output_table=None,
+            compact=False,
+            detailed=False,
+            render_markdown=True,
+            no_render_markdown=False,
+            _result_or_report=None,
+        )
+
+        with (
+            patch("skill_scanner.cli.cli.sys.stdout.isatty", return_value=False),
+            patch("skill_scanner.cli.cli.Console") as mock_console,
+            patch("builtins.print") as mock_print,
+        ):
+            _write_output(args, "# heading")
+
+        mock_console.return_value.print.assert_called_once()
+        rendered = mock_console.return_value.print.call_args.args[0]
+        assert rendered.__class__.__name__ == "Markdown"
+        mock_print.assert_not_called()
+
+    def test_write_output_output_fmt_takes_precedence_over_output(self, tmp_path):
+        """--output-<fmt> takes precedence over --output for the primary format."""
+        from skill_scanner.cli.cli import _format_single, _write_output
+
+        result = ScanResult(
+            skill_name="s",
+            skill_directory="/tmp/s",
+            findings=[_mk_finding("1")],
+        )
+
+        generic_path = str(tmp_path / "generic.txt")
+        md_path = str(tmp_path / "report.md")
+        args = argparse.Namespace(
+            format=["markdown"],
+            output=generic_path,
+            output_json=None,
+            output_sarif=None,
+            output_markdown=md_path,
+            output_html=None,
+            output_table=None,
+            compact=False,
+            detailed=False,
+            _result_or_report=result,
+        )
+
+        primary_output = _format_single("markdown", args, result)
+        _write_output(args, primary_output)
+
+        # --output-markdown should win over --output
+        assert Path(md_path).exists()
+        assert len(Path(md_path).read_text(encoding="utf-8")) > 0
+        # --output should NOT be written when --output-<fmt> is present
+        assert not Path(generic_path).exists()
 
     def test_cli_accepts_multiple_format_flags(self):
         """Argparse accepts --format json --format sarif without error."""

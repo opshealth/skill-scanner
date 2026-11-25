@@ -89,22 +89,52 @@ skill-scanner scan evals/skills/data-exfiltration/environment-secrets --format j
       "metadata": {
         "matched_pattern": "...",
         "aitech": "AITech-8.2",
-        "aitech_name": "Data Exfiltration / Exposure"
+        "aitech_name": "Data Exfiltration / Exposure",
+        "aisubtech": "AISubtech-8.2.3",
+        "aisubtech_name": "Data Exfiltration via Agent Tooling",
+        "aitech_mappings": ["..."],
+        "aisubtech_mappings": ["..."],
+        "framework_mappings": [
+          "OWASP: LLM02:2026: Sensitive Information Disclosure",
+          "OWASP: ASI02: Tool Misuse & Exploitation",
+          "OWASP: ASI09: Human-Agent Trust Exploitation",
+          "MITRE ATLAS: AML.T0086: Exfiltration via AI Agent Tool Invocation",
+          "NIST AML: N/A"
+        ],
+        "taxonomy_status": "mapped",
+        "taxonomy_source": "rule"
       }
     }
   ],
   "scan_duration_seconds": 0.13,
   "duration_ms": 127,
-  "analyzers_used": ["static_analyzer", "bytecode", "pipeline"],
+  "analyzers_used": ["static_analyzer", "bytecode", "pipeline", "llm_analyzer", "meta_analyzer"],
   "timestamp": "2026-02-19T21:58:33.032573",
   "scan_metadata": {
     "policy_name": "default",
     "policy_version": "1.0",
     "policy_preset_base": "balanced",
-    "policy_fingerprint_sha256": "45b486..."
+    "policy_fingerprint_sha256": "45b486...",
+    "taxonomy": {
+      "source": "builtin",
+      "version": "2.0.0",
+      "name": "Cisco AI Security and Safety Taxonomy",
+      "revision": "655a343ac943a51b6f61f86e47156e7752c15dc6",
+      "snapshot_sha256": "3df746f0...",
+      "findings": {"mapped": 9, "not_applicable": 1, "unmapped": 0}
+    }
+  },
+  "llm_usage": {
+    "input_tokens": 5312,
+    "output_tokens": 842,
+    "total_tokens": 6154
   }
 }
 ```
+
+Every finding's `metadata` carries the Cisco AI taxonomy fields (`aitech`, `aisubtech`, their names, crosswalks, `taxonomy_status`, `taxonomy_source`). See [Threat Taxonomy](../architecture/threat-taxonomy.md#finding-fields) for what each field means.
+
+`llm_usage` is present when the configured provider reports non-zero token usage for an LLM call made by `--use-llm`, `--enable-meta`, and/or `--adjudicate`. It is aggregated across every LLM analyzer, meta-analysis, and adjudication call for the scan. The field is omitted when no usage is reported, including static-only scans and calls from providers that do not return usage metadata.
 
 Use `--compact` to remove pretty-printing for machine pipelines.
 
@@ -250,4 +280,4 @@ The `summary` format is the default and is implemented directly in the CLI (`ski
 - Use `--compact` with JSON for machine pipelines.
 - Use `--detailed` with Markdown for deep triage output.
 - Use `--fail-on-findings` with SARIF or JSON in CI gates.
-- Use `--output`/`-o` to write to a file; omit to print to stdout.
+- Use `--output-<fmt>` (e.g. `--output-json`) to write a specific format to a file; `--output`/`-o` serves as the default when no format-specific flag is given. Omit both to print to stdout.

@@ -30,10 +30,12 @@ rule credential_harvesting_generic{
         ////////////////////////////////////////////////
 
         // API credentials - real keys only (not Bearer YOUR_*)
-        // AKIA keys, ghp_ tokens, sk- keys with actual values (not placeholders)
+        // AKIA keys, ghp_ tokens, legacy sk- keys, and documented provider-specific sk- prefixes
         $api_credentials_aws = /\bAKIA[0-9A-Z]{16}\b/
         $api_credentials_github = /\bghp_[A-Za-z0-9]{36}\b/
-        $api_credentials_sk = /\bsk-[A-Za-z0-9]{48,}\b/
+        $api_credentials_sk_legacy = /\bsk-[A-Za-z0-9]{48,}\b/
+        $api_credentials_openai_project = /\bsk-proj-[A-Za-z0-9_-]{20,}\b/
+        $api_credentials_anthropic = /\bsk-ant-api\d{2}-[A-Za-z0-9_-]{20,}\b/
 
         // SSH keys, certificates and credential file content
         $key_certificate_content = /(-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)/
@@ -42,7 +44,7 @@ rule credential_harvesting_generic{
         $ai_model_credential_names = /\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_API_KEY|GOOGLE_AI_KEY|GEMINI_API_KEY|COHERE_API_KEY|HUGGINGFACE_TOKEN|HF_TOKEN|TOGETHER_API_KEY|REPLICATE_API_TOKEN|MISTRAL_API_KEY)\s*=\s*['\"][A-Za-z0-9\-_]{20,}['\"]/
 
         // Suspicious environment variable theft (not just reading)
-        $env_var_theft = /\b(os\.environ\s*\[\s*['\"]?(AWS_SECRET|SECRET_KEY|PASSWORD)['\"]?\s*\]|getenv\s*\(\s*['\"]?(AWS_SECRET|SECRET_KEY|PASSWORD)['\"]?\s*\))\s*.*\s*(requests\.|urllib\.|socket\.)/i
+        $env_var_theft = /\b(os\.environ\s*\[\s*['\"]?(AWS_SECRET|SECRET_KEY|PASSWORD)['\"]?\s*\]|getenv\s*\(\s*['\"]?(AWS_SECRET|SECRET_KEY|PASSWORD)['\"]?\s*\))\s{0,16}.{0,256}\s{0,16}(requests\.|urllib\.|socket\.)/i
 
         ////////////////////////////////////////////////
         //// Specific credential file access (full paths only)
@@ -110,7 +112,9 @@ rule credential_harvesting_generic{
             // Real API credentials (high confidence specific patterns)
             $api_credentials_aws or
             $api_credentials_github or
-            $api_credentials_sk or
+            $api_credentials_sk_legacy or
+            $api_credentials_openai_project or
+            $api_credentials_anthropic or
 
             // Actual private key content
             $key_certificate_content or

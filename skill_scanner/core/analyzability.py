@@ -80,38 +80,11 @@ class AnalyzabilityReport:
         }
 
 
-# File types we can fully analyze
-_ANALYZABLE_TYPES = {"python", "bash", "markdown", "other"}
-
-# Extensions we can analyze as text
-_TEXT_EXTENSIONS = {
-    ".py",
-    ".sh",
-    ".bash",
-    ".rb",
-    ".pl",
-    ".js",
-    ".ts",
-    ".php",
-    ".md",
-    ".markdown",
-    ".txt",
-    ".rst",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".xml",
-    ".html",
-    ".css",
-    ".toml",
-    ".cfg",
-    ".ini",
-    ".conf",
-    ".csv",
-    ".env",
-    ".gitignore",
-    ".dockerignore",
-}
+# File types we can fully analyze. Must stay in sync with the file_type values
+# emitted by utils.file_utils.get_file_type -- JavaScript/TypeScript get their
+# own static rule sets (see analyzers/static.py) and are read by the LLM
+# analyzer, so they are fully inspectable, not opaque.
+_ANALYZABLE_TYPES = {"python", "bash", "javascript", "typescript", "markdown", "other"}
 
 # Extensions that are inert (viewable but no executable concern)
 _INERT_EXTENSIONS = {
@@ -131,6 +104,18 @@ _INERT_EXTENSIONS = {
     ".woff2",
     ".eot",
 }
+
+
+def _is_inert_embedded_ooxml_asset(sf: SkillFile) -> bool:
+    """Recognize non-executable font resources by container role, not vendor."""
+
+    if not sf.extracted_from or "!/" not in sf.relative_path:
+        return False
+    inner_path = sf.relative_path.rsplit("!/", 1)[-1].replace("\\", "/").lower()
+    suffix = sf.path.suffix.lower()
+    return (suffix == ".odttf" and inner_path.startswith("word/fonts/")) or (
+        suffix == ".fntdata" and inner_path.startswith("ppt/fonts/")
+    )
 
 
 def compute_analyzability(skill: Skill, *, policy: ScanPolicy | None = None) -> AnalyzabilityReport:
@@ -169,7 +154,16 @@ def compute_analyzability(skill: Skill, *, policy: ScanPolicy | None = None) -> 
 
         ext = sf.path.suffix.lower()
 
-        if sf.file_type in _ANALYZABLE_TYPES:
+        if _is_inert_embedded_ooxml_asset(sf):
+            fa.is_analyzable = True
+            fa.analysis_methods = ["office_asset_role", "extension_validation"]
+
+        elif ext in _INERT_EXTENSIONS:
+            # Inert files are "analyzable" (nothing executable to inspect).
+            fa.is_analyzable = True
+            fa.analysis_methods = ["magic_byte_check", "extension_validation"]
+
+        elif sf.file_type in _ANALYZABLE_TYPES:
             content = sf.read_content()
             if content:
                 fa.is_analyzable = True
@@ -177,11 +171,6 @@ def compute_analyzability(skill: Skill, *, policy: ScanPolicy | None = None) -> 
             else:
                 fa.is_analyzable = False
                 fa.skip_reason = "File exists but content is empty or unreadable"
-
-        elif ext in _INERT_EXTENSIONS:
-            # Inert files are "analyzable" (nothing to find)
-            fa.is_analyzable = True
-            fa.analysis_methods = ["magic_byte_check", "extension_validation"]
 
         elif ext in (".pyc", ".pyo"):
             # Bytecode - analyzable if we have matching source

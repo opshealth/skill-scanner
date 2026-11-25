@@ -5,6 +5,12 @@ on:
     branches:
       - main
   pull_request:
+  # The Homebrew workflow dispatches this on its formula branch, because pull
+  # requests opened with GITHUB_TOKEN do not trigger pull_request runs.
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -18,7 +24,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.27.1"
+          cache-dependency-path: tools/cel_runtime/go.sum
 
       - name: Set up Python for uv
         uses: astral-sh/setup-uv@v6.7.0
@@ -29,7 +36,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
+
+      - name: Verify CEL Go module and helper
+        working-directory: tools/cel_runtime
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go test ./...
+          go vet ./...
 
       - name: Run pre-commit hooks
         run: uv run pre-commit run --all-files
@@ -38,13 +53,19 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: tools/cel_runtime/go.sum
 
       - name: Set up Python for uv
         uses: astral-sh/setup-uv@v6.7.0
@@ -55,7 +76,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Run unit tests
         run: |
@@ -75,6 +96,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: tools/cel_runtime/go.sum
+
       - name: Set up Python for uv
         uses: astral-sh/setup-uv@v6.7.0
 
@@ -84,7 +111,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Run tests with coverage
         run: |
@@ -107,6 +134,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: tools/cel_runtime/go.sum
+
       - name: Set up Python for uv
         uses: astral-sh/setup-uv@v6.7.0
 
@@ -116,10 +149,18 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
+      # Fails the build on any new CVE in the locked tree.
+      # To temporarily allow a known-not-applicable finding, append
+      #   --ignore-vuln <GHSA-or-CVE-id>
+      # and document the justification in SECURITY.md (Vulnerability Allowlist).
+      # Note: --strict is intentionally omitted because our own package is
+      # always reported as "skipped" (not on PyPI from the local checkout).
       - name: Run pip-audit for vulnerability scanning
-        run: uv run pip-audit --require-hashes=false || true
+        run: uv run pip-audit
 
+      # liccheck currently fails to import pkg_resources on newer setuptools;
+      # tracked separately. Soft-fail until the upstream issue is resolved.
       - name: Run liccheck for license compliance
         run: uv run liccheck -s pyproject.toml || true

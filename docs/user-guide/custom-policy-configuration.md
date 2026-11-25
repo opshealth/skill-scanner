@@ -4,9 +4,11 @@
 > **Quick Answer**
 > Just want to scan with a preset? No YAML needed:
 > ```bash
-> skill-scanner scan --policy strict ./skill
+> skill-scanner scan --use-llm --policy low-noise ./skill
 > ```
 > Read on only if you need to customise thresholds, allowlists, or rule behavior.
+> Not sure which preset? [Recommended Settings](https://cisco-ai-defense.github.io/docs/skill-scanner/recommended-settings)
+> picks one by goal, with measured recall, false-positive rate and F1.
 
 Every organisation has a different security bar. A **scan policy** captures what counts as benign, which rules fire on which file types, which installer URLs are trusted, numeric thresholds, and more — all in a single YAML file.
 
@@ -22,6 +24,7 @@ Every organisation has a different security bar. A **scan policy** captures what
 - [Rule Governance Conventions](#rule-governance-conventions)
 - [Policy Reference](#policy-reference)
   - [Metadata](#metadata)
+  - [cel](#cel)
   - [hidden_files](#hidden_files)
   - [pipeline](#pipeline)
   - [rule_scoping](#rule_scoping)
@@ -37,6 +40,7 @@ Every organisation has a different security bar. A **scan policy** captures what
   - [finding_output](#finding_output)
   - [severity_overrides](#severity_overrides)
   - [disabled_rules](#disabled_rules)
+  - [suppressions](#suppressions)
 - [Interactive Configurator (TUI)](#interactive-configurator-tui)
 - [Examples](#examples)
 
@@ -46,11 +50,11 @@ Every organisation has a different security bar. A **scan policy** captures what
 
 ```bash
 # Scan with a built-in preset
-skill-scanner scan --policy strict ./my-skill
-skill-scanner scan --policy permissive ./my-skill
+skill-scanner scan --use-llm --policy low-noise ./my-skill
+skill-scanner scan --use-llm --policy quiet ./my-skill   # quiet only with the judge
 
 # Generate a policy file from a preset, then customise it
-skill-scanner generate-policy --preset balanced -o my_policy.yaml
+skill-scanner generate-policy --preset low-noise -o my_policy.yaml
 # ... edit my_policy.yaml ...
 skill-scanner scan --policy my_policy.yaml ./my-skill
 
@@ -85,32 +89,43 @@ skill-scanner configure-policy -o my_policy.yaml
 
 ## Built-in Presets
 
-| Preset | Description | Use when |
-|--------|-------------|----------|
-| **strict** | Narrow allowlists, no suppressions, lower thresholds | Auditing untrusted / external skills, compliance |
-| **balanced** | Sensible defaults, moderate filtering | CI/CD pipelines, everyday scanning |
-| **permissive** | Broad allowlists, aggressive suppression | Trusted internal skills, dev-time scanning |
+| Preset | CEL / correlation | Description | Use when |
+|--------|-------------------|-------------|----------|
+| **strict** | shadow / on | Narrow allowlists, no CEL suppression, lower thresholds | Audits and threat hunting where a person reads every finding; not measured as a gate |
+| **balanced** | shadow / on | Sensible defaults, moderate filtering | The default; with the LLM judge, the highest measured F1 |
+| **permissive** | off / off | Broad allowlists, aggressive suppression | Not measured as a gate; for fewer false positives prefer `low-noise` |
+| **low-noise** | shadow / on | `balanced`, with the 11 rules that alone produced the most judge-cleared flags on real skills reported at LOW, and low-confidence LLM findings at LOW | Everyday scanning where alert volume matters; costs 5 of 1,653 malicious detections on MaliciousSkillBench train/validation |
+| **quiet** | shadow / on | `low-noise` plus 8 more demotions and a LOW cap on LLM findings the model labels `CONTEXTUAL_RISK` | Triage queues limited by review capacity; about 1.3% of real skills flagged by the rules |
+
+`low-noise` and `quiet` were chosen from data -- how many judge-cleared real-skill flags each rule
+alone causes, against how many malicious development packages it alone detects -- and demote rather
+than disable: those findings are still reported, at LOW. The measurements are in
+[Measured results](../reference/measured-results.md#policy-packs-instead-of-knobs).
 
 Use a preset by name:
 
 ```bash
-skill-scanner scan --policy strict ./skill-dir
+skill-scanner scan --use-llm --policy low-noise ./skill-dir
 ```
 
 Or generate a file from a preset to customise:
 
 ```bash
-skill-scanner generate-policy --preset strict -o strict_custom.yaml
+skill-scanner generate-policy --preset low-noise -o low_noise_custom.yaml
 ```
 
 ---
 
 ## Preset Comparison
 
-The table below highlights the key differences between the three presets. Values not shown inherit from `balanced`.
+The table below highlights the key differences between `strict`, `balanced` and `permissive`. Values
+not shown inherit from `balanced`. `low-noise` and `quiet` are `balanced` with the
+`severity_overrides` and `llm_analysis` caps described above; every other setting matches `balanced`.
 
 | Setting | Strict | Balanced (default) | Permissive |
 |---------|--------|--------------------|------------|
+| **CEL mode** | shadow | shadow | off |
+| **Correlation analyzer** | enabled | enabled | disabled |
 | **Benign dotfiles** | 6 (git + editor + docker) | 47 (standard dev toolchain) | 65 (+ Bazel, Rust, Swift, etc.) |
 | **Benign dotdirs** | 3 (.github, .circleci, .gitlab) | 26 (+ .vscode, .cache, etc.) | 40 (+ .yarn, .terraform, etc.) |
 | **Known installer domains** | 0 (none trusted) | 17 (Rust, nvm, Docker, etc.) | 27 (+ Helm, k3s, Linkerd, etc.) |
@@ -121,7 +136,7 @@ The table below highlights the key differences between the three presets. Values
 | **Rule scoping: doc path dirs** | 2 (references, docs) | 11 (+ examples, fixtures, test, etc.) | 14 (+ tests, spec, samples, patterns, etc.) |
 | **Test credentials suppressed** | 0 (none) | 7 (Stripe test, JWT.io, placeholders) | 15 (+ AWS EXAMPLE, changeme, etc.) |
 | **Inert extensions** | 18 (default) | 18 (fonts, images, pyc) | 25 (+ mp3, mp4, wav, etc.) |
-| **Archive extensions** | 18 (default) | 18 (zip, tar, jar, docx, etc.) | 23 (+ whl, egg, deb, rpm, etc.) |
+| **Archive extensions** | 21 (default) | 21 (zip, tar, jar, docx, etc.) | 26 (+ whl, egg, nupkg, deb, rpm) |
 | **Code extensions** | 8 (default) | 8 (py, sh, rb, js, ts, php, etc.) | 17 (+ go, rs, java, swift, etc.) |
 | **Max file count** | 50 | 100 | 500 |
 | **Max file size** | 2 MB | 5 MB | 20 MB |
@@ -137,7 +152,7 @@ The table below highlights the key differences between the three presets. Values
 | **Analyzability LOW risk** | 95% | 90% | 80% |
 | **Analyzability MEDIUM risk** | 80% | 70% | 50% |
 | **Sensitive file patterns** | 5 (+ sudoers, .kube, .jks) | 5 (passwd, .ssh, .env, etc.) | 4 (narrower — passwd, .ssh only) |
-| **Severity overrides** | 3 (BINARY→MEDIUM, HIDDEN→MEDIUM, PYCACHE→MEDIUM) | none | 3 (ARCHIVE→LOW, PACKAGE_INSTALL→LOW, JS FS access→MEDIUM) |
+| **Severity overrides** | 3 (BINARY→MEDIUM, HIDDEN→MEDIUM, PYCACHE→MEDIUM) | none | 2 (ARCHIVE→LOW, PACKAGE_INSTALL→LOW) |
 | **Disabled rules** | none | none | 8 (adds deep nesting, invalid name, capability/indirect prompt inflation, hidden glob, homoglyph, embedded shebang, JS network) |
 
 ---
@@ -178,15 +193,18 @@ Then edit the generated file to add your trusted domains, extra benign dotfiles,
 
 - **Lists replace, don't append.** If you override `known_installer_domains`, include *all* domains you want — the default list is discarded.
 - **Use `severity_overrides` to tune, not disable.** Instead of disabling a noisy rule, consider demoting it to `LOW` or `INFO`.
-- **Use `disabled_rules` sparingly.** Disabled rules produce zero findings, which means zero visibility.
+- **Use `disabled_rules` sparingly.** Disabled rules produce zero findings, which means zero visibility. When a rule is only wrong in one place, reach for `suppressions` instead — it scopes the exception to the skills or paths it was reviewed for and keeps the rule live everywhere else.
 - **Version your policies.** Use `policy_version` and commit policies to your repo so changes are tracked.
 - **Keep ownership clean.** Use policy YAML for allowlists/thresholds/scoping, keep YARA/signatures for detection logic, and avoid duplicating the same decision in multiple layers.
+- **Keep optional packs explicit.** The core pack is always present; enable ATR
+  only with `--rule-packs atr`. ATR is not part of the current core + CEL
+  release gate.
 
 ### Rule Governance Conventions
 
 - **ID conventions:** Keep signature IDs in `SCREAMING_SNAKE_CASE` (e.g. `DATA_EXFIL_HTTP_POST`) and YARA findings as `YARA_<rule_name>` (e.g. `YARA_code_execution_generic`).
 - **Severity strategy:** Use detector defaults for baseline severity; apply org-specific risk posture via `severity_overrides`.
-- **Scoping strategy:** Use `rule_scoping` for context-aware enablement (docs/code/SKILL.md), not `disabled_rules`.
+- **Scoping strategy:** Use `rule_scoping` for context-aware enablement (docs/code/SKILL.md), not `disabled_rules`. For an exception that belongs to one skill or one path rather than to a file category, use `suppressions`.
 - **Suppression strategy:** Put known placeholders and safe cleanup paths in policy (`credentials`, `system_cleanup`) instead of hardcoding in analyzers.
 
 ---
@@ -196,7 +214,7 @@ Then edit the generated file to add your trusted domains, extra benign dotfiles,
 Click any section to expand its configuration keys and YAML examples.
 
 <details>
-<summary>Metadata</summary>
+<summary id="metadata">Metadata</summary>
 
 ```yaml
 policy_name: my-org              # Display name for reports
@@ -209,7 +227,32 @@ preset_base: strict              # Which preset this derives from (strict / bala
 </details>
 
 <details>
-<summary>hidden_files</summary>
+<summary id="cel">cel</summary>
+
+Controls the typed CEL decision layer that runs after deterministic analyzers
+and before optional LLM analysis.
+
+```yaml
+cel:
+  mode: shadow  # off | shadow | enforce
+```
+
+- `off` skips evaluation but still compiles and type-checks every selected CEL
+  expression at startup.
+- `shadow` retains findings and records `keep` or `would_suppress` decisions in
+  scan metadata.
+- `enforce` can suppress only when the individual rule also declares
+  `rollout: enforce`.
+
+Runtime errors, non-Boolean results, incomplete projections, and circuit-breaker
+events fail open and retain the candidate. Every bundled rule currently uses
+`rollout: shadow`, so setting global mode to `enforce` does not yet suppress a
+bundled finding. Use `--cel-mode` to override this setting for one invocation.
+
+</details>
+
+<details>
+<summary id="hidden_files">hidden_files</summary>
 
 Controls which dotfiles and dot-directories are treated as benign (not flagged as hidden data).
 
@@ -229,7 +272,7 @@ hidden_files:
 </details>
 
 <details>
-<summary>pipeline</summary>
+<summary id="pipeline">pipeline</summary>
 
 Controls the pipeline taint analysis engine.
 
@@ -239,7 +282,7 @@ pipeline:
     - "sh.rustup.rs"
     - "install.mycompany.com"
 
-  benign_pipe_targets:       # Regex patterns for safe pipe chains (full pipeline matched)
+  benign_pipe_targets:       # Regex patterns for safe pipe chains (matched from the start)
     - 'ps\s.*\|\s*grep'
     - 'mycommand\s.*\|\s*jq'
 
@@ -253,12 +296,17 @@ pipeline:
   compound_fetch_filter_api_requests: true
   compound_fetch_filter_shell_wrapped_fetch: true
   compound_fetch_exec_prefixes: ["sudo", "env", "time"]
-  compound_fetch_exec_commands: ["bash", "sh", "python"]
+  compound_fetch_exec_commands: ["bash", "sh", "powershell", "pwsh", "python"]
 ```
 
 **Impact:**
 - `known_installer_domains`: Matching `curl|sh` patterns are flagged at LOW instead of HIGH.
-- `benign_pipe_targets`: Matching pipe chains are suppressed entirely.
+- `benign_pipe_targets`: Matching pipe chains are suppressed entirely. A pattern is matched from the
+  start of the chain, and whatever follows the match may only be the last command's own arguments:
+  `mycommand\s.*\|\s*jq` covers `mycommand --json | jq '.items[] | .name'`, but a later pipe, `;`,
+  `&&`, redirection, or command substitution (including `$(...)` inside double quotes) keeps the
+  finding. A match must also end at a word boundary, so `jq` does not cover `jqsh`. Redirects to
+  `/dev/null` are allowed.
 - `doc_path_indicators`: Findings in doc paths get reduced severity.
 - `dedupe_equivalent_pipelines`: De-dupes equivalent pipeline chains found by multiple extraction paths.
 - `compound_fetch_*` knobs: Tune fetch-and-execute detection strictness and false-positive suppression.
@@ -266,7 +314,7 @@ pipeline:
 </details>
 
 <details>
-<summary>rule_scoping</summary>
+<summary id="rule_scoping">rule_scoping</summary>
 
 Controls which rule sets (YARA and other analyzers) fire on which file categories.
 
@@ -299,7 +347,7 @@ rule_scoping:
 </details>
 
 <details>
-<summary>credentials</summary>
+<summary id="credentials">credentials</summary>
 
 Controls which well-known test credentials are automatically suppressed.
 
@@ -321,7 +369,7 @@ credentials:
 </details>
 
 <details>
-<summary>system_cleanup</summary>
+<summary id="system_cleanup">system_cleanup</summary>
 
 Controls which cleanup targets are considered safe when `rm -r`/`rm -rf` patterns are detected.
 
@@ -339,7 +387,7 @@ system_cleanup:
 </details>
 
 <details>
-<summary>file_classification</summary>
+<summary id="file_classification">file_classification</summary>
 
 Controls how file extensions are routed for analysis.
 
@@ -384,7 +432,7 @@ file_classification:
 </details>
 
 <details>
-<summary>file_limits</summary>
+<summary id="file_limits">file_limits</summary>
 
 Numeric thresholds for file inventory checks.
 
@@ -407,7 +455,7 @@ file_limits:
 </details>
 
 <details>
-<summary>analysis_thresholds</summary>
+<summary id="analysis_thresholds">analysis_thresholds</summary>
 
 Numeric thresholds for YARA and analyzability scoring.
 
@@ -436,7 +484,7 @@ analysis_thresholds:
 </details>
 
 <details>
-<summary>sensitive_files</summary>
+<summary id="sensitive_files">sensitive_files</summary>
 
 Regex patterns for file paths that upgrade taint in pipeline analysis.
 
@@ -455,7 +503,7 @@ sensitive_files:
 </details>
 
 <details>
-<summary>command_safety</summary>
+<summary id="command_safety">command_safety</summary>
 
 Controls which commands belong to each safety tier. The scanner uses a tiered evaluation to decide whether a `code_execution_generic` YARA finding should be suppressed (safe/caution) or kept (risky/dangerous).
 
@@ -492,7 +540,7 @@ command_safety:
 </details>
 
 <details>
-<summary>analyzers</summary>
+<summary id="analyzers">analyzers</summary>
 
 Enable or disable entire analysis passes.
 
@@ -501,37 +549,45 @@ analyzers:
   static: true    # Static pattern analysis (YARA, regex, manifest checks)
   bytecode: true  # Python bytecode integrity checks
   pipeline: true  # Shell pipeline taint analysis
+  correlation: true  # Bounded structured source/sink and staged-behavior correlation
 ```
 
-**Impact:** Set `pipeline: false` to skip pipeline analysis entirely (useful if your skills never contain shell scripts). Disabling an analyzer removes all its findings from the scan results.
+**Impact:** Set `pipeline: false` to skip pipeline analysis entirely (useful if your skills never contain shell scripts). Set `correlation: false` to disable structured cross-file and fenced-code flow candidates. Disabling an analyzer removes all its findings from the scan results. The permissive preset keeps correlation off by default for its lower-noise posture.
 
 </details>
 
 <details>
-<summary>llm_analysis</summary>
+<summary id="llm_analysis">llm_analysis</summary>
 
 Controls prompt budget limits for the LLM analyzer and meta-analyzer. The meta-analyzer multiplies the base limits by `meta_budget_multiplier` so it always has more headroom for cross-correlation.
 
 ```yaml
 llm_analysis:
   max_instruction_body_chars: 20000    # Max chars for SKILL.md instruction body
-  max_code_file_chars: 15000           # Max chars per individual code file
+  max_code_file_chars: 15000           # Full-inclusion threshold and max excerpt size per code file; 0 excludes directly formatted code-file contents
   max_referenced_file_chars: 10000     # Max chars per referenced file
   max_total_prompt_chars: 100000       # Total prompt budget across all files
   max_output_tokens: 8192              # Max tokens for LLM responses
   meta_budget_multiplier: 3.0          # Meta-analyzer multiplies above limits by this factor
+  trusted_reference_domains:           # Org domains trusted for transitive trust / supply chain
+    - "gitlab.internal.example.com"
+  contextual_risk_max_severity: ""     # e.g. "LOW": cap findings the model labels CONTEXTUAL_RISK
+  low_confidence_max_severity: ""      # e.g. "LOW": cap findings the model rates LOW confidence
 ```
 
 **Impact:**
-- Files or instruction bodies exceeding these limits are skipped entirely (no truncation) and a budget-skip metadata entry is attached to the scan result.
-- `max_output_tokens` controls the output token budget for both the LLM analyzer and meta-analyzer. Raise this if scans produce truncated JSON (`LLM_ANALYSIS_FAILED` findings). The CLI flag `--llm-max-tokens` overrides this value.
+- Oversized code files may contribute bounded excerpts of executable lines, imports, or high-risk calls; source line numbers are preserved, and the budget finding states that the full file was not analyzed. Set `max_code_file_chars` to `0` to keep directly formatted code-file contents out of LLM requests. Referenced files use `max_referenced_file_chars` and may still be included when within that limit. An oversized instruction body is reduced to its beginning and end, with the omission marked; oversized referenced files are skipped entirely. The scan result includes a budget entry in either case.
+- `max_output_tokens` controls the output token budget for both the LLM analyzer and meta-analyzer. The CLI flag `--llm-max-tokens` and API `llm_max_tokens` field override environment variables; `SKILL_SCANNER_META_LLM_MAX_TOKENS` (meta only) and `SKILL_SCANNER_LLM_MAX_TOKENS` override this policy value. All values must be positive integers. If a provider reports an output limit, the scanner emits an explicit truncation diagnostic instead of treating partial JSON as an ordinary parse error.
 - The meta-analyzer applies `meta_budget_multiplier` on top of the base input limits. With the defaults, the meta-analyzer gets 60K instruction, 45K per file, and 300K total.
 - Increase these values for skills with large codebases or extensive instructions. Decrease them to reduce LLM API costs.
+- `contextual_risk_max_severity`: every LLM finding carries the model's own label, `TRUE_POSITIVE` (the cited evidence establishes the behavior) or `CONTEXTUAL_RISK` (a risky capability whose intent, reach or execution is not established). Setting this to `LOW` reports contextual findings at LOW, so only established behavior gates; the original severity is kept in `llm_severity_before_cap`. On MaliciousSkillBench it cut the judge's MEDIUM+ false-positive rate by two thirds or more, at a recall cost of 5 points on train/validation and 16 on the test split. Empty by default; on in the `quiet` preset.
+- `low_confidence_max_severity`: the same cap for findings the model rates `LOW` confidence, whatever their label -- a middle operating point that took the judge's real-skill MEDIUM+ flag rate from 10.5% to 7.6% for 2.5 points of train/validation recall. On in `low-noise` and `quiet`.
+- `trusted_reference_domains`: LLM findings (transitive trust, supply chain) that reference only URLs or domains in this list are demoted to LOW severity. The static `SUPPLY_CHAIN_REGISTRY_REDIRECT` rule also demotes to LOW when the registry host is a listed domain or one of its subdomains. `UNDECLARED_NETWORK_DESTINATION` is always reported at LOW. Use this for your organization's internal infrastructure — Git repositories, package registries, documentation portals, artifact stores — that the LLM would otherwise flag as untrusted external sources. Empty by default (all external references flagged normally).
 
 </details>
 
 <details>
-<summary>finding_output</summary>
+<summary id="finding_output">finding_output</summary>
 
 Controls final finding dedupe behavior and metadata stamping.
 
@@ -568,7 +624,7 @@ Field behavior:
 </details>
 
 <details>
-<summary>severity_overrides</summary>
+<summary id="severity_overrides">severity_overrides</summary>
 
 Per-rule severity overrides — raise or lower any rule's severity without disabling it.
 
@@ -590,7 +646,7 @@ severity_overrides:
 </details>
 
 <details>
-<summary>disabled_rules</summary>
+<summary id="disabled_rules">disabled_rules</summary>
 
 Completely suppress specific rule IDs — they produce zero findings.
 
@@ -607,6 +663,63 @@ disabled_rules:
 
 </details>
 
+<details>
+<summary id="suppressions">suppressions</summary>
+
+Silence — or re-rate — a rule for the skills and paths it was reviewed for,
+instead of switching it off for every skill in the run.
+
+```yaml
+suppressions:
+  - rule_id: HOMOGLYPH_ATTACK
+    skills: ["docs-translator"]
+    reason: "Skill legitimately contains Cyrillic prose"
+    expires: 2030-12-31
+
+  - rule_id: ARCHIVE_FILE_DETECTED
+    paths: ["**/fixtures/**/*.zip"]
+    reason: "Test fixtures"
+
+  - rule_id: PDF_STRUCTURAL_THREAT
+    skills: ["report-builder"]
+    paths: ["assets/*.pdf"]
+    severity: LOW
+    reason: "Reviewed; re-rated, not hidden"
+```
+
+**Fields:**
+
+| Field | Required | Meaning |
+|---|---|---|
+| `rule_id` | yes | The rule the entry applies to |
+| `skills` | one of the two | Globs matched against the skill name |
+| `paths` | one of the two | Globs matched against the file path, relative to the skill directory |
+| `reason` | no | Justification; surfaced in JSON and as the SARIF suppression justification |
+| `severity` | no | Re-rate the finding to this severity — raise or lower — and keep it, instead of suppressing it |
+| `expires` | no | ISO date (`YYYY-MM-DD`); after it the entry is inert and a warning is logged |
+
+**Matching:** patterns within one selector are ORed; when both `skills` and
+`paths` are given, both must match. `*` and `?` never cross a `/` — use `**` to
+span directories. Matching is case-insensitive and Windows separators are
+normalized.
+
+**Every entry needs at least one selector.** A selector-less entry is rejected at
+load time: it would be indistinguishable from `disabled_rules`.
+
+**Impact:** A suppressed finding is removed from `findings`, so it does not
+affect the verdict, the severity counters, or the exit code. It is *not*
+discarded:
+
+- it appears under `suppressed_findings` in JSON output,
+- the scan metadata gains a `suppressions` summary with per-entry counts,
+- SARIF emits it as a suppressed result (`"suppressions": [{"kind": "external", …}]`),
+  so GitHub Code Scanning shows it as dismissed rather than losing it.
+
+**Limitation:** cross-skill findings are never suppressed by a scoped entry —
+they have no owning skill and no real file path. Use `disabled_rules` for those.
+
+</details>
+
 ---
 
 ## Interactive Configurator (TUI)
@@ -619,7 +732,7 @@ skill-scanner configure-policy -o my_policy.yaml
 
 The configurator:
 
-1. Lets you pick a starting preset (strict / balanced / permissive)
+1. Lets you pick a starting preset (strict / balanced / permissive / low-noise / quiet)
 2. Names your policy
 3. Walks through each section — you choose which to customise
 4. Shows a summary for review
@@ -657,6 +770,10 @@ pipeline:
     - "install.internal.example.com"
     - "sh.rustup.rs"
     - "get.docker.com"
+
+llm_analysis:
+  trusted_reference_domains:
+    - "gitlab.internal.example.com"
 
 file_limits:
   max_file_count: 300

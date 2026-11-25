@@ -4,7 +4,8 @@ This guide covers setting up your development environment, running tests, and co
 
 ## Prerequisites
 
-- **Python 3.10+** - Required for running the project
+- **CPython 3.11–3.14** - Required for running the project
+- **Go 1.27.1+** - Required to build the bundled CEL helper from a source checkout
 - **Git** - For version control
 - **uv** - Fast Python package manager (installation instructions below)
 
@@ -34,6 +35,9 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 ```bash
 # Install all dependencies including dev extras
 uv sync --all-extras
+
+# Rebuild the host CEL helper explicitly if the Go runtime changes
+uv run python scripts/build_cel_helper.py --in-place
 ```
 
 ### 4. Install Pre-commit Hooks
@@ -52,6 +56,9 @@ uv run pytest tests/ -q
 
 # Run linting
 uv run pre-commit run --all-files
+
+# Compile and type-check every selected rule, including CEL
+uv run skill-scanner validate-rules
 ```
 
 ## Development Workflow
@@ -147,7 +154,7 @@ evals/
 ## Running Individual Analyzers
 
 ```bash
-# Core analyzers only (default: static + bytecode + pipeline)
+# Core analyzers only (default: static + bytecode + pipeline + correlation)
 skill-scanner scan /path/to/skill
 
 # With behavioral analysis
@@ -177,12 +184,27 @@ This project publishes a `.pre-commit-hooks.yaml` so other repos can use Skill S
 # In the consuming repo's .pre-commit-config.yaml
 repos:
   - repo: https://github.com/cisco-ai-defense/skill-scanner
-    rev: v1.0.0
+    rev: 2.3.2
     hooks:
       - id: skill-scanner
 ```
 
-The hook entry point is `skill-scanner-pre-commit` (defined in `pyproject.toml`). It automatically detects staged skill directories via `git diff --cached` and only scans those.
+Set `"use_llm": true` in the consuming repo's `.skill_scannerrc` so the hook runs the LLM judge, as
+the recommended setups do (see [Integrations](integrations.md#using-pre-commit-framework)).
+
+The hook entry point is `skill-scanner-pre-commit` (defined in `pyproject.toml`).
+It computes staged paths internally, maps each file to the nearest parent
+containing `SKILL.md`, and scans every affected skill once.
+
+For incremental CI checks, let pre-commit expose the two available revisions;
+the hook computes their changed paths, including deletions, internally:
+
+```bash
+pre-commit run skill-scanner --from-ref "$BASE_SHA" --to-ref "$HEAD_SHA"
+```
+
+Ensure the CI checkout contains both revisions (for example, avoid a shallow
+checkout that omits the base commit).
 
 ## GitHub Actions Reusable Workflow
 
@@ -191,3 +213,62 @@ The file `.github/workflows/scan-skills.yml` is a reusable workflow that other r
 ## Versioning
 
 This project follows [Semantic Versioning](https://semver.org/).
+The version comes from the git tag through hatch-vcs: there is no version string to edit, and tags
+carry no `v` prefix (`2.3.2`, not `v2.3.2`).
+
+## Cutting a Release
+
+1. Confirm every workflow on `main` is green, not only the required `test (3.12)` check:
+
+   ```bash
+   gh run list -R cisco-ai-defense/skill-scanner --branch main --limit 10
+   ```
+
+2. Run the local gate on the commit to release:
+
+   ```bash
+   uv sync --all-extras --frozen
+   uv run pre-commit run --all-files
+   uv run pytest tests/ --ignore=tests/test_llm_analyzer.py
+   uv run python evals/runners/benchmark_runner.py --eval-dir evals/skills
+   uv run pip-audit
+   ```
+
+3. Tag the commit and create the GitHub release **as a draft**. `release.yml` attaches the hash-pinned
+   `requirements.txt`, the CycloneDX SBOM and the CEL supply-chain files to the draft and then
+   publishes it; it cannot attach them to a release that is already published.
+
+   ```bash
+   git tag 2.3.2 <main-sha> && git push origin 2.3.2
+   gh release create 2.3.2 -R cisco-ai-defense/skill-scanner --draft --verify-tag \
+     --generate-notes --notes-start-tag <previous-tag>
+   ```
+
+   Add a hand-written summary of highlights and behavior changes to the draft notes.
+
+4. Publish to PyPI and watch the run:
+
+   ```bash
+   gh workflow run release.yml -R cisco-ai-defense/skill-scanner --ref main -f version=2.3.2
+   gh run watch -R cisco-ai-defense/skill-scanner
+   ```
+
+5. Verify the release:
+
+   ```bash
+   gh release view 2.3.2 -R cisco-ai-defense/skill-scanner --json assets --jq '.assets[].name'
+   uvx --from cisco-ai-skill-scanner==2.3.2 skill-scanner --version
+   ```
+
+   The assets must include `requirements.txt`, `sbom.cdx.json` and the `cel-go-*.json` files, and
+   PyPI must list five platform wheels and the sdist.
+
+6. Update the Homebrew formula. The workflow builds and smoke-installs it on macOS ARM and Intel,
+   then pushes a `chore/homebrew-formula-<version>` branch. The organization does not let GitHub
+   Actions open pull requests, so open one from the compare link the run prints, then approve and
+   merge it. (If that policy changes, the workflow opens the pull request itself and dispatches the
+   unit tests on it.)
+
+   ```bash
+   gh workflow run update-homebrew.yml -R cisco-ai-defense/skill-scanner -f version=2.3.2
+   ```

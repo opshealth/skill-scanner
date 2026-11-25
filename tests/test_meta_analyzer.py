@@ -33,7 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skill_scanner.core.models import Finding, Severity, Skill, SkillFile, SkillManifest, ThreatCategory
+from skill_scanner.core.models import Finding, ScanResult, Severity, Skill, SkillFile, SkillManifest, ThreatCategory
 from skill_scanner.core.scan_policy import LLMAnalysisPolicy, ScanPolicy
 
 
@@ -86,8 +86,11 @@ class TestMetaAnalysisResult:
         result = MetaAnalysisResult(
             validated_findings=[
                 {
+                    "_index": 0,
+                    "_source_identity_bound": True,
                     "id": "test_1",
                     "rule_id": "TEST_RULE",
+                    "analyzer": "static",
                     "category": "prompt_injection",
                     "severity": "HIGH",
                     "title": "Test Finding",
@@ -118,6 +121,7 @@ class TestMetaAnalysisResult:
             missed_threats=[
                 {
                     "aitech": "AITech-1.1",
+                    "category": "malware",
                     "severity": "HIGH",
                     "title": "Missed Prompt Injection",
                     "description": "Detected by meta-analysis",
@@ -133,6 +137,251 @@ class TestMetaAnalysisResult:
         assert findings[0].title == "Missed Prompt Injection"
         assert findings[0].analyzer == "meta"
         assert findings[0].metadata.get("meta_detected") is True
+        assert findings[0].rule_id == "META_DETECTED_PROMPT_INJECTION"
+        assert findings[0].category is ThreatCategory.PROMPT_INJECTION
+        assert findings[0].metadata["model_category"] == "malware"
+        assert findings[0].metadata["canonical_category"] == "prompt_injection"
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {
+                "_index": 0,
+                "_source_identity_bound": True,
+                "analyzer": "static",
+                "category": "policy_violation",
+                "severity": "MEDIUM",
+            },
+            {
+                "_index": 0,
+                "_source_identity_bound": True,
+                "rule_id": "TEST_RULE",
+                "category": "policy_violation",
+                "severity": "MEDIUM",
+            },
+            {
+                "_index": 0,
+                "rule_id": "TEST_RULE",
+                "analyzer": "static",
+                "category": "policy_violation",
+                "severity": "MEDIUM",
+            },
+        ],
+    )
+    def test_validated_finding_without_bound_source_identity_is_rejected(self, entry: dict[str, object]):
+        """Meta validation may not invent a generic replacement identity."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalysisResult
+
+        skill = MagicMock(spec=Skill)
+        skill.name = "test-skill"
+        result = MetaAnalysisResult(validated_findings=[entry])
+
+        assert result.get_validated_findings(skill) == []
+
+    def test_safe_missed_threat_is_rejected(self):
+        """SAFE is an overall verdict, not a newly detected threat."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalysisResult
+
+        skill = MagicMock(spec=Skill)
+        skill.name = "test-skill"
+        result = MetaAnalysisResult(
+            missed_threats=[
+                {
+                    "severity": "SAFE",
+                    "category": "policy_violation",
+                    "title": "Not a threat",
+                }
+            ]
+        )
+
+        assert result.get_missed_threats(skill) == []
+
+    @pytest.mark.parametrize("category", list(ThreatCategory))
+    def test_category_specific_missed_identity_matches_manifest(self, category: ThreatCategory):
+        """Every canonical missed-threat category has one strict pack identity."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalysisResult
+        from skill_scanner.core.python_rule_inventory import meta_detected_rule_id
+        from skill_scanner.core.rule_registry import PackLoader
+
+        skill = MagicMock(spec=Skill)
+        skill.name = "test-skill"
+        result = MetaAnalysisResult(
+            missed_threats=[
+                {
+                    "severity": "INFO",
+                    "category": category.value,
+                    "title": "Bounded missed threat",
+                    "description": "Inert test evidence",
+                }
+            ]
+        )
+
+        finding = result.get_missed_threats(skill)[0]
+        assert finding.rule_id == meta_detected_rule_id(category)
+        assert finding.category is category
+        assert PackLoader().build_registry().validate_bundled_python_finding(finding, require_known=True) == ()
+
+    def test_enrichment_overwrites_untrusted_identity_with_known_source(self):
+        """Validated copies are bound to their original detector identity."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalysisResult, MetaAnalyzer
+
+        original = Finding(
+            id="source-id",
+            rule_id="SOURCE_RULE",
+            category=ThreatCategory.PROMPT_INJECTION,
+            severity=Severity.HIGH,
+            title="Source title",
+            description="Source description",
+            analyzer="static",
+        )
+        result = MetaAnalysisResult(
+            validated_findings=[
+                {
+                    "_index": 0,
+                    "id": "model-id",
+                    "rule_id": "MODEL_RULE",
+                    "category": "malware",
+                    "severity": "CRITICAL",
+                    "analyzer": "meta",
+                }
+            ]
+        )
+
+        MetaAnalyzer._enrich_findings(MetaAnalyzer.__new__(MetaAnalyzer), result, [original])
+
+        enriched = result.validated_findings[0]
+        assert enriched["id"] == original.id
+        assert enriched["rule_id"] == original.rule_id
+        assert enriched["category"] == original.category.value
+        assert enriched["severity"] == original.severity.value
+        assert enriched["analyzer"] == original.analyzer
+        assert enriched["_source_identity_bound"] is True
+
+
+class TestOverallRiskAssessmentNormalization:
+    """Tests for MetaAnalyzer._normalize_overall_risk_assessment().
+
+    The meta-analysis prompt asks the model for exactly two enum-like
+    fields, ``risk_level`` (CRITICAL|HIGH|MEDIUM|LOW|SAFE) and
+    ``skill_verdict`` (SAFE|SUSPICIOUS|MALICIOUS). Unlike per-finding
+    ``severity``/``category``, nothing previously validated these against
+    their documented values, so an off-schema or oddly-cased string from
+    the model flowed straight through to reporters unchanged.
+    """
+
+    def test_valid_uppercase_values_pass_through_unchanged(self):
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        assessment = {"risk_level": "HIGH", "skill_verdict": "MALICIOUS", "summary": "x"}
+        normalized = MetaAnalyzer._normalize_overall_risk_assessment(assessment)
+
+        assert normalized["risk_level"] == "HIGH"
+        assert normalized["skill_verdict"] == "MALICIOUS"
+        assert normalized["summary"] == "x"
+        assert "raw_risk_level" not in normalized
+        assert "raw_skill_verdict" not in normalized
+
+    def test_valid_values_are_case_normalized(self):
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        normalized = MetaAnalyzer._normalize_overall_risk_assessment(
+            {"risk_level": "safe", "skill_verdict": "  suspicious  "}
+        )
+
+        assert normalized["risk_level"] == "SAFE"
+        assert normalized["skill_verdict"] == "SUSPICIOUS"
+        assert "raw_risk_level" not in normalized
+        assert "raw_skill_verdict" not in normalized
+
+    def test_off_schema_values_collapse_to_unknown_with_raw_preserved(self):
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        normalized = MetaAnalyzer._normalize_overall_risk_assessment(
+            {"risk_level": "NONE", "skill_verdict": "MALICIOUS_ISH"}
+        )
+
+        assert normalized["risk_level"] == "UNKNOWN"
+        assert normalized["raw_risk_level"] == "NONE"
+        assert normalized["skill_verdict"] == "UNKNOWN"
+        assert normalized["raw_skill_verdict"] == "MALICIOUS_ISH"
+
+    def test_model_cannot_self_report_unknown_without_being_flagged(self):
+        """UNKNOWN is reserved for the scanner's own degradation path."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        normalized = MetaAnalyzer._normalize_overall_risk_assessment({"skill_verdict": "UNKNOWN"})
+
+        assert normalized["skill_verdict"] == "UNKNOWN"
+        assert normalized["raw_skill_verdict"] == "UNKNOWN"
+
+    def test_missing_fields_stay_absent(self):
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        assert MetaAnalyzer._normalize_overall_risk_assessment({}) == {}
+        assert MetaAnalyzer._normalize_overall_risk_assessment({"summary": "no findings"}) == {"summary": "no findings"}
+
+    def test_present_blank_values_normalize_to_unknown(self):
+        """A *present* empty/whitespace value is an invalid enum value, not an absent field."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        normalized = MetaAnalyzer._normalize_overall_risk_assessment({"risk_level": "", "skill_verdict": "   "})
+
+        assert normalized["risk_level"] == "UNKNOWN"
+        assert normalized["raw_risk_level"] == ""
+        assert normalized["skill_verdict"] == "UNKNOWN"
+        assert normalized["raw_skill_verdict"] == "   "
+
+    def test_parse_response_rejects_off_schema_assessment(self):
+        """Provider output must satisfy the strict assessment contract before normalization."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalysisParseError, MetaAnalyzer
+
+        analyzer = MetaAnalyzer(model="test-model", api_key="test-key")
+        response = json.dumps(
+            {
+                "overall_risk_assessment": {
+                    "risk_level": "none",
+                    "skill_verdict": "suspicious",
+                    "summary": "test",
+                },
+                "validated_findings": [],
+                "false_positives": [],
+                "missed_threats": [],
+                "priority_order": [],
+                "correlations": [],
+                "recommendations": [],
+            }
+        )
+
+        with pytest.raises(MetaAnalysisParseError, match="missing or unexpected fields"):
+            analyzer._parse_response(response, [], original_indices=[], fallback_on_error=False)
+
+    @pytest.mark.parametrize(
+        ("assessment", "missing_fields"),
+        [
+            ({"risk_level": "LOW", "summary": "missing verdict"}, ("skill_verdict",)),
+            ({"skill_verdict": "SAFE", "summary": "missing risk"}, ("risk_level",)),
+            ({"summary": "missing both"}, ("risk_level", "skill_verdict")),
+        ],
+    )
+    def test_parse_response_rejects_missing_required_assessment_fields(self, assessment, missing_fields):
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalysisParseError, MetaAnalyzer
+
+        analyzer = MetaAnalyzer(model="test-model", api_key="test-key")
+        response = json.dumps(
+            {
+                "overall_risk_assessment": assessment,
+                "validated_findings": [],
+                "false_positives": [],
+                "missed_threats": [],
+                "priority_order": [],
+                "correlations": [],
+                "recommendations": [],
+            }
+        )
+
+        assert missing_fields
+        with pytest.raises(MetaAnalysisParseError, match="missing or unexpected fields"):
+            analyzer._parse_response(response, [], original_indices=[], fallback_on_error=False)
 
 
 class TestMetaAnalyzerInit:
@@ -282,7 +531,7 @@ class TestApplyMetaAnalysis:
         skill = MagicMock(spec=Skill)
         skill.name = "test-skill"
 
-        original_findings = []
+        original_findings: list[Finding] = []
 
         meta_result = MetaAnalysisResult(
             validated_findings=[],
@@ -416,7 +665,7 @@ class TestAITechTaxonomy:
         if not prompt_path.exists():
             pytest.skip("Prompt file not found")
 
-        prompt_content = prompt_path.read_text()
+        prompt_content = prompt_path.read_text(encoding="utf-8")
 
         # Check that key AITech codes are mentioned
         expected_codes = [
@@ -581,3 +830,158 @@ class TestMetaAnalyzerBudgetGating:
         context, skipped = analyzer._build_skill_context(skill)
         assert code_content in context
         assert skipped == []
+
+
+class TestMetaDropParams:
+    """Regression: MetaAnalyzer._make_llm_request must pass drop_params=True."""
+
+    @pytest.mark.asyncio
+    async def test_acompletion_called_with_drop_params(self, tmp_path):
+        """MetaAnalyzer must pass drop_params=True to acompletion."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        analyzer = MetaAnalyzer(
+            model="gpt-5.4-2026-03-05",
+            api_key="test-key",
+        )
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            '{"validated_findings": [], "false_positives": [], "missed_threats": [], '
+            '"correlations": [], "recommendations": [], "overall_risk_level": "NONE", '
+            '"priority_findings": []}'
+        )
+
+        with patch(
+            "skill_scanner.core.analyzers.meta_analyzer.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_acompletion:
+            mock_acompletion.return_value = mock_response
+            await analyzer._make_llm_request("system prompt", "user prompt")
+
+        assert mock_acompletion.called, "acompletion should have been called"
+        call_kwargs = mock_acompletion.call_args
+        kwargs = call_kwargs.kwargs if call_kwargs.kwargs else call_kwargs[1]
+        assert kwargs.get("drop_params") is True, f"acompletion must be called with drop_params=True, got: {kwargs}"
+
+    @pytest.mark.asyncio
+    async def test_openai_user_param_sent_for_openai_model(self):
+        """MetaAnalyzer sends the optional user field only for OpenAI-like routes."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        raw_user = '{"appkey":"test-appkey"}'
+        analyzer = MetaAnalyzer(
+            model="gpt-5-nano",
+            api_key="test-key",
+            llm_user=raw_user,
+        )
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"validated_findings": [], "false_positives": []}'
+
+        with patch(
+            "skill_scanner.core.analyzers.meta_analyzer.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_acompletion:
+            mock_acompletion.return_value = mock_response
+            await analyzer._make_llm_request("system prompt", "user prompt")
+
+        kwargs = mock_acompletion.call_args.kwargs
+        assert kwargs["user"] == raw_user
+        assert kwargs.get("drop_params") is True
+
+    @pytest.mark.asyncio
+    async def test_openai_user_param_not_sent_for_non_openai_model(self):
+        """MetaAnalyzer does not send the optional user field for non-OpenAI routes."""
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        analyzer = MetaAnalyzer(
+            model="anthropic/claude-sonnet-4-20250514",
+            api_key="test-key",
+            llm_user='{"appkey":"test-appkey"}',
+        )
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"validated_findings": [], "false_positives": []}'
+
+        with patch(
+            "skill_scanner.core.analyzers.meta_analyzer.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_acompletion:
+            mock_acompletion.return_value = mock_response
+            await analyzer._make_llm_request("system prompt", "user prompt")
+
+        kwargs = mock_acompletion.call_args.kwargs
+        assert "user" not in kwargs
+        assert kwargs.get("drop_params") is True
+
+
+class TestMergeMetaAnalyzerUsage:
+    """merge_meta_analyzer_usage() folds MetaAnalyzer spend into a ScanResult.
+
+    This is the fix for the gap where MetaAnalyzer always runs as a separate
+    post-processing step (see cli.py / api/router.py), so SkillScanner's own
+    llm_usage aggregation never sees its token spend.
+    """
+
+    def _make_result(self, llm_usage=None) -> ScanResult:
+        return ScanResult(skill_name="s", skill_directory="/tmp/s", llm_usage=llm_usage)
+
+    def _make_analyzer(self):
+        from skill_scanner.core.analyzers.meta_analyzer import MetaAnalyzer
+
+        return MetaAnalyzer(model="claude-3-5-sonnet-20241022", api_key="test-key")
+
+    @staticmethod
+    def _merge(result, analyzer) -> None:
+        from skill_scanner.core.analyzers.meta_analyzer import merge_meta_analyzer_usage
+
+        merge_meta_analyzer_usage(result, analyzer)
+
+    def test_merges_into_result_with_no_prior_llm_usage(self) -> None:
+        result = self._make_result(llm_usage=None)
+        analyzer = self._make_analyzer()
+        analyzer._llm_usage = {"input_tokens": 5000, "output_tokens": 500, "total_tokens": 5500}
+
+        self._merge(result, analyzer)
+
+        assert result.llm_usage == {"input_tokens": 5000, "output_tokens": 500, "total_tokens": 5500}
+
+    def test_adds_to_existing_llm_usage_rather_than_overwriting(self) -> None:
+        result = self._make_result(llm_usage={"input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200})
+        analyzer = self._make_analyzer()
+        analyzer._llm_usage = {"input_tokens": 5000, "output_tokens": 500, "total_tokens": 5500}
+
+        self._merge(result, analyzer)
+
+        assert result.llm_usage == {"input_tokens": 6000, "output_tokens": 700, "total_tokens": 6700}
+
+    def test_noop_when_meta_analyzer_made_no_llm_call(self) -> None:
+        # e.g. analyze_with_findings() returned early because there were no findings
+        result = self._make_result(llm_usage=None)
+        analyzer = self._make_analyzer()
+
+        self._merge(result, analyzer)
+
+        assert result.llm_usage is None
+
+    def test_noop_preserves_existing_llm_usage_unchanged(self) -> None:
+        existing = {"input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200}
+        result = self._make_result(llm_usage=dict(existing))
+        analyzer = self._make_analyzer()
+
+        self._merge(result, analyzer)
+
+        assert result.llm_usage == existing
+
+    def test_does_not_mutate_meta_analyzer_llm_usage(self) -> None:
+        result = self._make_result(llm_usage=None)
+        analyzer = self._make_analyzer()
+        analyzer._llm_usage = {"input_tokens": 5000, "output_tokens": 500, "total_tokens": 5500}
+
+        self._merge(result, analyzer)
+
+        assert analyzer.llm_usage == {"input_tokens": 5000, "output_tokens": 500, "total_tokens": 5500}

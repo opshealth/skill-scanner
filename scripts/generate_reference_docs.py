@@ -32,10 +32,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_DIR = ROOT / "docs" / "reference"
+REFERENCE_PYTHON = (3, 12)
 
 GENERATED_BANNER = (
     "<!-- GENERATED FILE. DO NOT EDIT DIRECTLY.\n"
-    "     Regenerate with: uv run python scripts/generate_reference_docs.py -->\n\n"
+    "     Regenerate with: uv run --python 3.12 python scripts/generate_reference_docs.py -->\n\n"
 )
 
 
@@ -53,11 +54,15 @@ def _run_python_module_help(module_and_args: list[str]) -> str:
     return proc.stdout.strip()
 
 
+_OPTIONAL_SEMANTIC_FLAGS_SECTION = "## Optional semantic flags\n\nBoth of these are accepted by `scan`, `scan-all` and `scan-repo`, and both are off by\ndefault.\n\n### `--llm-decompose`\n\nRun the LLM analyzer once per focus — declared purpose against actual behaviour, policy\nand instruction surface, and concrete security behaviours — and union the findings,\ninstead of making one general pass. It raises recall where a single pass was missing\nfindings, at roughly three times the model calls.\n\nThe size of the gain depends on the model and on how much headroom the single pass left,\nand on one positive-only corpus recall fell. Read [measured\nresults](measured-results.md) before assuming a figure transfers.\n\nRequires `--use-llm`.\n\n### `--system-one-endpoint` and `--system-one-model`\n\n| Flag | Meaning |\n|---|---|\n| `--system-one-endpoint URL` | A System One endpoint speaking `POST /v1/systemone`. Must be `https`, or `http` on loopback; a plaintext remote endpoint is refused so skill content is not sent in clear text. |\n| `--system-one-model NAME` | The model name to send to that endpoint. Required whenever the endpoint is set; supplying one without the other is an error rather than a silent default. |\n\nThe bearer token is read from `SKILL_SCANNER_SYSTEM_ONE_API_KEY` and never from the\ncommand line, so it does not land in shell history or a process listing.\n\n**This tier is advisory only.** It records a calibrated probability and cannot emit a\nfinding, change a severity, or alter the verdict. That is deliberate: across 439 records\nand two prompt framings, the model measured scored *inverted* with respect to the label\n(AUC 0.25–0.31), so wiring it into severity would have made the scanner worse. The\nintegration ships because the protocol is model-agnostic and a future model may separate\nthe classes. Demonstrating that separation on a corpus is the precondition for anything\nacting on it. See [measured results](measured-results.md).\n"
+
+
 def _render_cli_reference() -> str:
     blocks = [
         HelpBlock("Top-level CLI", ["-m", "skill_scanner.cli.cli", "--help"]),
         HelpBlock("scan", ["-m", "skill_scanner.cli.cli", "scan", "--help"]),
         HelpBlock("scan-all", ["-m", "skill_scanner.cli.cli", "scan-all", "--help"]),
+        HelpBlock("scan-repo", ["-m", "skill_scanner.cli.cli", "scan-repo", "--help"]),
         HelpBlock("validate-rules", ["-m", "skill_scanner.cli.cli", "validate-rules", "--help"]),
         HelpBlock("generate-policy", ["-m", "skill_scanner.cli.cli", "generate-policy", "--help"]),
         HelpBlock("configure-policy", ["-m", "skill_scanner.cli.cli", "configure-policy", "--help"]),
@@ -76,31 +81,39 @@ def _render_cli_reference() -> str:
         "|---|---|---|",
         "| `skill-scanner scan` | Scan a single skill package | `skill-scanner scan ./my-skill` |",
         "| `skill-scanner scan-all` | Scan multiple skill packages | `skill-scanner scan-all ./skills/ -r` |",
+        "| `skill-scanner scan-repo` | Clone and scan a GitHub repo (owner/repo or full URL) | `skill-scanner scan-repo owner/repo` |",
         "| `skill-scanner list-analyzers` | Show available analyzers | `skill-scanner list-analyzers` |",
-        "| `skill-scanner validate-rules` | Validate YAML rule signatures | `skill-scanner validate-rules` |",
+        "| `skill-scanner validate-rules` | Validate selected schema-v2 packs and compile/type-check CEL | `skill-scanner validate-rules` |",
         "| `skill-scanner generate-policy` | Generate a policy YAML file | `skill-scanner generate-policy --preset strict` |",
         "| `skill-scanner configure-policy` | Interactive TUI policy editor | `skill-scanner configure-policy` |",
         "| `skill-scanner interactive` | Interactive setup wizard | `skill-scanner interactive` |",
         "| `skill-scanner-api` | Start the REST API server | `skill-scanner-api --port 8080` |",
-        "| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit install` |",
+        "| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit --install` |",
         "",
         "## Common Flags",
         "",
-        "Flags shared by `scan` and `scan-all`:",
+        "Flags shared by `scan`, `scan-all` and `scan-repo`:",
         "",
         "| Flag | Default | Description |",
         "|---|---|---|",
         "| `--format FORMAT` | `summary` | Output format: `summary`, `json`, `markdown`, `table`, `sarif`, `html` |",
-        "| `--output FILE` | stdout | Write output to a file instead of stdout |",
+        "| `--output FILE` | stdout | Default output file path (overridden by `--output-<fmt>`) |",
         "| `--policy POLICY` | `balanced` | Policy preset name or path to a custom YAML |",
+        "| `--cel-mode MODE` | policy | Override CEL mode: `off`, `shadow`, or `enforce` |",
+        "| `--trusted-rule-pack PATH` | none | Load an administrator-trusted schema-v2 signature/YARA/CEL pack; repeatable |",
         "| `--use-llm` | off | Enable the LLM semantic analyzer |",
         "| `--use-behavioral` | off | Enable the behavioral analyzer |",
         "| `--use-virustotal` | off | Enable VirusTotal hash lookups |",
         "| `--use-aidefense` | off | Enable Cisco AI Defense analyzer |",
-        "| `--enable-meta` | off | Enable the meta (cross-correlation) analyzer |",
+        "| `--use-osv` | off | Enable OSV.dev dependency vulnerability scanning (no API key; requires network) |",
+        "| `--llm-reasoning-effort LEVEL` | provider default | Optional reasoning depth: `disabled`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Direct Google GenAI SDK requests reject configured controls; LiteLLM-backed Gemini requests support them. |",
+        "| `--llm-decompose` | off | Run the LLM analyzer once per focus and union the findings instead of making one general pass. Raises recall at roughly three times the model calls. Requires `--use-llm`. See [Optional semantic flags](#optional-semantic-flags). |",
+        "| `--system-one-endpoint URL` | off | Optional System One screening endpoint speaking `POST /v1/systemone`. **Advisory only**: it can never change a finding, a severity or the verdict. `https`, or `http` on loopback. |",
+        "| `--system-one-model NAME` | none | Model name for the System One endpoint. Required with `--system-one-endpoint`, and rejected without it. |",
+        "| `--enable-meta` | off | Enable the meta (cross-correlation) analyzer. Measured to cost recall; leave it off unless you have measured it on your skills |",
         "| `--fail-on-findings` | off | Exit non-zero if critical or high findings are reported; equivalent to `--fail-on-severity high` (CI gate) |",
         "| `--fail-on-severity LEVEL` | off | Exit non-zero if findings at or above LEVEL exist (critical, high, medium, low, info) |",
-        "| `--lenient` | off | Tolerate malformed skills: coerce bad fields, fill defaults, and continue instead of failing |",
+        "| `--lenient` | off | Tolerate malformed YAML / missing fields: coerce bad fields, fill defaults, and continue instead of failing. Binary and non-UTF-8 files always fail. |",
         "| `--detailed` | off | Include full evidence in output |",
         "| `--compact` | off | Minimize output (JSON: no pretty-print) |",
         "| `--verbose` | off | Verbose logging |",
@@ -127,6 +140,8 @@ def _render_cli_reference() -> str:
                 "",
             ]
         )
+
+    sections.append(_OPTIONAL_SEMANTIC_FLAGS_SECTION)
 
     return GENERATED_BANNER + "\n".join(sections).rstrip() + "\n"
 
@@ -203,31 +218,58 @@ def _extract_pydantic_models(router_path: Path) -> list[PydanticModel]:
     module = ast.parse(router_path.read_text(encoding="utf-8"))
     models: list[PydanticModel] = []
 
-    for node in module.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    class_nodes = {node.name: node for node in module.body if isinstance(node, ast.ClassDef)}
 
-        base_names: set[str] = set()
+    def base_names(node: ast.ClassDef) -> list[str]:
+        names: list[str] = []
         for base in node.bases:
             try:
-                base_names.add(ast.unparse(base))
+                names.append(ast.unparse(base))
             except Exception:
                 continue
+        return names
 
-        if not any(name.endswith("BaseModel") or name == "BaseModel" for name in base_names):
-            continue
+    def is_pydantic_model(name: str, seen: set[str] | None = None) -> bool:
+        node = class_nodes.get(name)
+        if node is None:
+            return False
+        visited = set() if seen is None else set(seen)
+        if name in visited:
+            return False
+        visited.add(name)
+        for base_name in base_names(node):
+            if base_name == "BaseModel" or base_name.endswith(".BaseModel"):
+                return True
+            if is_pydantic_model(base_name, visited):
+                return True
+        return False
 
+    def model_fields(name: str, seen: set[str] | None = None) -> list[ModelField]:
+        node = class_nodes[name]
+        visited = set() if seen is None else set(seen)
+        if name in visited:
+            return []
+        visited.add(name)
         fields: list[ModelField] = []
+        for base_name in base_names(node):
+            if base_name in class_nodes and is_pydantic_model(base_name):
+                fields.extend(model_fields(base_name, visited))
         for stmt in node.body:
             if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-                fname = stmt.target.id
                 try:
                     annotation = ast.unparse(stmt.annotation)
                 except Exception:
                     annotation = "<unknown>"
-                fields.append(ModelField(name=fname, annotation=annotation))
+                fields.append(ModelField(name=stmt.target.id, annotation=annotation))
+        return fields
 
-        models.append(PydanticModel(name=node.name, fields=fields))
+    for node in module.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if node.name.startswith("_") or not is_pydantic_model(node.name):
+            continue
+
+        models.append(PydanticModel(name=node.name, fields=model_fields(node.name)))
 
     return models
 
@@ -327,7 +369,8 @@ def _render_api_reference() -> str:
         sections.append("| Field | Type |")
         sections.append("|---|---|")
         for field in model.fields:
-            sections.append(f"| `{field.name}` | `{field.annotation}` |")
+            annotation = field.annotation.replace("|", "\\|")
+            sections.append(f"| `{field.name}` | `{annotation}` |")
         sections.append("")
 
     sections.extend(
@@ -336,7 +379,8 @@ def _render_api_reference() -> str:
             "",
             "- API behavior is policy-aware and mirrors CLI analyzer selection flags.",
             "- API keys for VirusTotal and AI Defense are passed via request headers (`X-VirusTotal-Key`, `X-AIDefense-Key`), not in the JSON body.",
-            "- Set `SKILL_SCANNER_ALLOWED_ROOTS` to restrict which directories the API can scan.",
+            "- With `SKILL_SCANNER_ALLOWED_ROOTS` unset, the API can access only its process-private `0700` upload root. Set the variable to allow server-side scan targets, policy files, or custom-rule directories.",
+            "- `llm_reasoning_effort` accepts `disabled`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; omission preserves the provider default. Direct Google GenAI SDK requests reject configured controls, while LiteLLM-backed Gemini requests support them.",
             "- All `POST` endpoints accept JSON bodies. File upload uses `multipart/form-data`.",
         ]
     )
@@ -359,11 +403,14 @@ def _collect_env_variables() -> dict[str, set[str]]:
 
     candidates = [
         ROOT / "skill_scanner" / "config" / "config.py",
+        ROOT / "skill_scanner" / "llm_token_options.py",
+        ROOT / "skill_scanner" / "llm_reasoning.py",
         ROOT / "skill_scanner" / "cli" / "cli.py",
         ROOT / "skill_scanner" / "api" / "router.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "llm_analyzer.py",
         ROOT / "skill_scanner" / "core" / "analyzer_factory.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "llm_provider_config.py",
+        ROOT / "skill_scanner" / "core" / "analyzers" / "llm_request_options.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "behavioral_analyzer.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "aidefense_analyzer.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "meta_analyzer.py",
@@ -371,32 +418,129 @@ def _collect_env_variables() -> dict[str, set[str]]:
         ROOT / "skill_scanner" / "threats" / "threats.py",
     ]
 
-    env_get_re = re.compile(r'os\.(?:getenv|environ\.get)\(\s*"([A-Z][A-Z0-9_]+)"')
-    env_const_re = re.compile(r'^(_?[A-Z][A-Z0-9_]+)\s*(?::\s*str\s*)?=\s*"([A-Z][A-Z0-9_]+)"', re.MULTILINE)
     for path in candidates:
         if not path.exists():
             continue
         text = path.read_text(encoding="utf-8")
         rel = str(path.relative_to(ROOT))
-        for var in env_get_re.findall(text):
+        for var in _extract_python_env_variables(text):
             add(var, rel)
-        for const_name, var_value in env_const_re.findall(text):
-            if re.search(rf"os\.(?:getenv|environ\.get)\(\s*{const_name}", text):
-                add(var_value, rel)
+
+    runtime_env_sources = {
+        "skill_scanner/llm_token_options.py": (
+            "SKILL_SCANNER_LLM_MAX_TOKENS",
+            "SKILL_SCANNER_META_LLM_MAX_TOKENS",
+        ),
+        "skill_scanner/llm_reasoning.py": (
+            "SKILL_SCANNER_LLM_REASONING_EFFORT",
+            "SKILL_SCANNER_META_LLM_REASONING_EFFORT",
+        ),
+        "skill_scanner/core/analyzers/llm_request_handler.py": ("SKILL_SCANNER_LLM_TEMPERATURE",),
+        "skill_scanner/core/analyzers/meta_analyzer.py": ("SKILL_SCANNER_META_LLM_TEMPERATURE",),
+        "skill_scanner/core/analyzers/adjudicator.py": (
+            "SKILL_SCANNER_ADJUDICATOR_LLM_TEMPERATURE",
+            "SKILL_SCANNER_ADJUDICATOR_LLM_REASONING_EFFORT",
+            "SKILL_SCANNER_ADJUDICATOR_LLM_MAX_TOKENS",
+        ),
+    }
+    for source, variables in runtime_env_sources.items():
+        for var in variables:
+            add(var, source)
 
     return dict(sorted(env_map.items()))
 
 
+def _extract_python_env_variables(source: str) -> set[str]:
+    """Return environment names used by executable ``os`` lookup calls.
+
+    Parsing the syntax tree avoids treating examples in comments or docstrings
+    as supported configuration. Module constants passed to the lookup are
+    resolved so helpers such as ``os.getenv(LLM_REASONING_EFFORT_ENV_VAR)``
+    remain discoverable.
+    """
+    tree = ast.parse(source)
+    constants: dict[str, str] = {}
+    env_name_re = re.compile(r"[A-Z][A-Z0-9_]+")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            constants[node.target.id] = node.value.value
+
+    variables: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+
+        function = node.func
+        is_getenv = (
+            isinstance(function, ast.Attribute)
+            and function.attr == "getenv"
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "os"
+        )
+        is_environ_get = (
+            isinstance(function, ast.Attribute)
+            and function.attr == "get"
+            and isinstance(function.value, ast.Attribute)
+            and function.value.attr == "environ"
+            and isinstance(function.value.value, ast.Name)
+            and function.value.value.id == "os"
+        )
+        if not (is_getenv or is_environ_get):
+            continue
+
+        argument = node.args[0]
+        value = argument.value if isinstance(argument, ast.Constant) and isinstance(argument.value, str) else None
+        if isinstance(argument, ast.Name):
+            value = constants.get(argument.id)
+        if value and env_name_re.fullmatch(value):
+            variables.add(value)
+
+    return variables
+
+
 def _describe_env_var(var: str) -> str:
     descriptions = {
-        "SKILL_SCANNER_LLM_API_KEY": "Primary API key for LLM analyzer and meta fallback.",
+        "SKILL_SCANNER_LLM_API_KEY": (
+            "Primary API key for LLM analyzer and meta fallback. Required for "
+            "API-key-based providers; not required for Bedrock (IAM), Ollama "
+            "(local), or Vertex AI (ambient Application Default Credentials)."
+        ),
         "SKILL_SCANNER_LLM_MODEL": "Primary model identifier for semantic analysis.",
+        "SKILL_SCANNER_LLM_PROVIDER": "Optional provider override, including OpenAI-compatible custom endpoint routing.",
         "SKILL_SCANNER_LLM_BASE_URL": "Optional custom endpoint base URL for provider routing.",
         "SKILL_SCANNER_LLM_API_VERSION": "Optional API version for providers that require one.",
+        "SKILL_SCANNER_LLM_USER": "Optional raw Chat Completions user field for OpenAI-compatible routes.",
+        "SKILL_SCANNER_LLM_MAX_TOKENS": (
+            "Positive integer output-token budget. Overrides the active policy's "
+            "`llm_analysis.max_output_tokens` value."
+        ),
+        "SKILL_SCANNER_LLM_REASONING_EFFORT": (
+            "Optional reasoning-depth control: `disabled`, `minimal`, `low`, `medium`, `high`, `xhigh`, or "
+            "`max`. Unset preserves the provider default. Direct Google GenAI SDK requests reject configured "
+            "controls; LiteLLM-backed Gemini requests support them."
+        ),
+        "SKILL_SCANNER_LLM_FORCE_JSON_OBJECT": "Skip json_schema and start in plain JSON mode for incompatible proxies.",
         "SKILL_SCANNER_META_LLM_API_KEY": "Meta-analyzer API key override.",
         "SKILL_SCANNER_META_LLM_MODEL": "Meta-analyzer model override.",
         "SKILL_SCANNER_META_LLM_BASE_URL": "Meta-analyzer base URL override.",
         "SKILL_SCANNER_META_LLM_API_VERSION": "Meta-analyzer API version override.",
+        "SKILL_SCANNER_META_LLM_MAX_TOKENS": (
+            "Positive integer meta-analysis output budget; falls back to `SKILL_SCANNER_LLM_MAX_TOKENS`."
+        ),
+        "SKILL_SCANNER_META_LLM_REASONING_EFFORT": (
+            "Meta-analyzer reasoning-depth override; falls back to `SKILL_SCANNER_LLM_REASONING_EFFORT`. "
+            "Direct Google GenAI SDK requests reject configured controls; LiteLLM-backed Gemini requests support them."
+        ),
         "VIRUSTOTAL_API_KEY": "VirusTotal analyzer API key.",
         "VIRUSTOTAL_UPLOAD_FILES": "Enable upload mode for unknown binaries.",
         "AI_DEFENSE_API_KEY": "Cisco AI Defense analyzer API key.",
@@ -404,10 +548,44 @@ def _describe_env_var(var: str) -> str:
         "AWS_REGION": "AWS region for Bedrock-backed flows.",
         "AWS_PROFILE": "AWS credential profile for Bedrock IAM auth.",
         "AWS_SESSION_TOKEN": "Optional AWS session token.",
-        "GOOGLE_APPLICATION_CREDENTIALS": "Path to GCP service account credentials.",
-        "SKILL_SCANNER_ALLOWED_ROOTS": "Colon-delimited API path allowlist for server-side path access.",
+        "GOOGLE_APPLICATION_CREDENTIALS": (
+            "Path to GCP service account credentials. Optional -- if unset, "
+            "`vertex_ai/*` models fall back to ambient Application Default "
+            "Credentials (e.g. a GCE/Cloud Run attached service account or "
+            "Workload Identity), same as Bedrock's IAM role fallback."
+        ),
+        "SKILL_SCANNER_ALLOWED_ROOTS": (
+            "Colon-delimited API allowlist for server-side scan targets, policy files, and custom-rule directories. "
+            "When unset, the API can access only its process-private `0700` upload root."
+        ),
         "SKILL_SCANNER_TAXONOMY_PATH": "Path to a custom Cisco AI taxonomy YAML file (overridden by `--taxonomy`).",
         "SKILL_SCANNER_THREAT_MAPPING_PATH": "Path to a custom threat mapping YAML file (overridden by `--threat-mapping`).",
+        "SKILL_SCANNER_LLM_TEMPERATURE": (
+            "Sampling temperature for LLM requests, or `none` to omit it. When unset, the scanner sends 0 and "
+            "omits it for models that reject it (Claude Sonnet 5.x, Opus 4.7 and later, Fable, OpenAI reasoning "
+            "models)."
+        ),
+        "SKILL_SCANNER_ADJUDICATOR_LLM_TEMPERATURE": (
+            "Adjudicator sampling temperature override, or `none` to omit it; falls back to "
+            "`SKILL_SCANNER_LLM_TEMPERATURE`."
+        ),
+        "SKILL_SCANNER_ADJUDICATOR_LLM_REASONING_EFFORT": (
+            "Adjudicator reasoning level (`disabled`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). The "
+            "adjudicator's answer-token budget is small and reasoning tokens count against it, so reasoning is "
+            "off by default. Does not fall back to `SKILL_SCANNER_LLM_REASONING_EFFORT`. Has no effect on the "
+            "on-device Apple FM model, whose SDK has no reasoning control."
+        ),
+        "SKILL_SCANNER_ADJUDICATOR_LLM_MAX_TOKENS": (
+            "Adjudicator answer-token budget override. A secondary safety net, not the fix for a truncated "
+            "answer: raise it only if a verdict genuinely needs more than one sentence. Does not fall back to "
+            "`SKILL_SCANNER_LLM_MAX_TOKENS`, which targets the semantic and meta analyzers and defaults far higher."
+        ),
+        "SKILL_SCANNER_LLM_REPAIR_INCONSISTENT_VERDICT": "Repair for a self-contradicting model response, **on by default**. Some models return a `SAFE` package verdict together with a non-empty findings array, which the strict parser rejects, discarding the whole analysis -- on benign skills far more often than malicious ones, so the skill goes un-analysed and passes the gate. The verdict is escalated to `SUSPICIOUS` and the findings are kept. Escalate-only: it never downgrades a verdict, so it cannot hide a detection. Set `0`, `false`, `no` or `off` to restore the strict path.",
+        "SKILL_SCANNER_META_LLM_TEMPERATURE": "Meta-analyzer sampling temperature override. Lower values make the arbitration more repeatable; note that temperature 0 is not determinism, and replays of the same input can still differ.",
+        "SKILL_SCANNER_SYSTEM_ONE_API_KEY": (
+            "Bearer token for the optional System One screening endpoint (`--system-one-endpoint`). Read from the "
+            "environment only, never from the command line."
+        ),
         "GEMINI_API_KEY": "Google AI Studio key; auto-set from `SKILL_SCANNER_LLM_API_KEY` when using Gemini via LiteLLM.",
         "ENABLE_STATIC_ANALYZER": "Optional environment toggle for static analyzer default.",
         "ENABLE_LLM_ANALYZER": "Optional environment toggle for LLM analyzer default.",
@@ -424,8 +602,18 @@ _ENV_VAR_GROUPS: list[tuple[str, str, list[str]]] = [
         [
             "SKILL_SCANNER_LLM_API_KEY",
             "SKILL_SCANNER_LLM_MODEL",
+            "SKILL_SCANNER_LLM_PROVIDER",
             "SKILL_SCANNER_LLM_BASE_URL",
             "SKILL_SCANNER_LLM_API_VERSION",
+            "SKILL_SCANNER_LLM_USER",
+            "SKILL_SCANNER_LLM_MAX_TOKENS",
+            "SKILL_SCANNER_LLM_REASONING_EFFORT",
+            "SKILL_SCANNER_LLM_FORCE_JSON_OBJECT",
+            "SKILL_SCANNER_LLM_REPAIR_INCONSISTENT_VERDICT",
+            "SKILL_SCANNER_LLM_TEMPERATURE",
+            "SKILL_SCANNER_ADJUDICATOR_LLM_TEMPERATURE",
+            "SKILL_SCANNER_ADJUDICATOR_LLM_REASONING_EFFORT",
+            "SKILL_SCANNER_ADJUDICATOR_LLM_MAX_TOKENS",
         ],
     ),
     (
@@ -436,6 +624,9 @@ _ENV_VAR_GROUPS: list[tuple[str, str, list[str]]] = [
             "SKILL_SCANNER_META_LLM_MODEL",
             "SKILL_SCANNER_META_LLM_BASE_URL",
             "SKILL_SCANNER_META_LLM_API_VERSION",
+            "SKILL_SCANNER_META_LLM_MAX_TOKENS",
+            "SKILL_SCANNER_META_LLM_REASONING_EFFORT",
+            "SKILL_SCANNER_META_LLM_TEMPERATURE",
         ],
     ),
     (
@@ -475,19 +666,34 @@ _ENV_VAR_GROUPS: list[tuple[str, str, list[str]]] = [
             "SKILL_SCANNER_ALLOWED_ROOTS",
             "SKILL_SCANNER_TAXONOMY_PATH",
             "SKILL_SCANNER_THREAT_MAPPING_PATH",
+            "SKILL_SCANNER_SYSTEM_ONE_API_KEY",
         ],
     ),
 ]
 
 _ENV_VAR_EXAMPLES: dict[str, str] = {
     "SKILL_SCANNER_LLM_API_KEY": "sk-ant-...",
-    "SKILL_SCANNER_LLM_MODEL": "anthropic/claude-sonnet-4-20250514",
+    "SKILL_SCANNER_LLM_MODEL": "claude-sonnet-5-5",
+    "SKILL_SCANNER_LLM_PROVIDER": "openai",
     "SKILL_SCANNER_LLM_BASE_URL": "https://api.openai.com/v1",
     "SKILL_SCANNER_LLM_API_VERSION": "2024-02-15-preview",
+    "SKILL_SCANNER_LLM_USER": '{"appkey":"your-appkey"}',
+    "SKILL_SCANNER_LLM_MAX_TOKENS": "16384",
+    "SKILL_SCANNER_LLM_REASONING_EFFORT": "low",
+    "SKILL_SCANNER_LLM_FORCE_JSON_OBJECT": "true",
+    "SKILL_SCANNER_LLM_REPAIR_INCONSISTENT_VERDICT": "0",
+    "SKILL_SCANNER_META_LLM_TEMPERATURE": "0",
+    "SKILL_SCANNER_SYSTEM_ONE_API_KEY": "(provider token)",
+    "SKILL_SCANNER_LLM_TEMPERATURE": "none",
+    "SKILL_SCANNER_ADJUDICATOR_LLM_TEMPERATURE": "0",
+    "SKILL_SCANNER_ADJUDICATOR_LLM_REASONING_EFFORT": "disabled",
+    "SKILL_SCANNER_ADJUDICATOR_LLM_MAX_TOKENS": "200",
     "SKILL_SCANNER_META_LLM_API_KEY": "(falls back to LLM_API_KEY)",
     "SKILL_SCANNER_META_LLM_MODEL": "(falls back to LLM_MODEL)",
     "SKILL_SCANNER_META_LLM_BASE_URL": "(falls back to LLM_BASE_URL)",
     "SKILL_SCANNER_META_LLM_API_VERSION": "(falls back to LLM_API_VERSION)",
+    "SKILL_SCANNER_META_LLM_MAX_TOKENS": "32768",
+    "SKILL_SCANNER_META_LLM_REASONING_EFFORT": "low",
     "AWS_REGION": "us-east-1",
     "AWS_PROFILE": "my-bedrock-profile",
     "AWS_SESSION_TOKEN": "(temporary STS token)",
@@ -506,7 +712,9 @@ _ENV_VAR_EXAMPLES: dict[str, str] = {
     "SKILL_SCANNER_THREAT_MAPPING_PATH": "/path/to/threats.yaml",
 }
 
-_ENV_VAR_REQUIRED: set[str] = {"SKILL_SCANNER_LLM_API_KEY"}
+_ENV_VAR_REQUIRED: set[str] = set()
+
+_BEDROCK_MANTLE_SECTION = "### Bedrock mantle route\n\nSome Bedrock models are published only on the OpenAI-compatible *mantle* endpoint rather than on\n`bedrock-runtime`. Reach those with the `bedrock-mantle/` prefix, for example\n`bedrock-mantle/google.gemma-4-26b-a4b`. The route is signed with SigV4 against service name\n`bedrock`, so it uses the same IAM credentials as `bedrock/` and needs no API key. It is a separate\nprovider because `bedrock/` signs against `bedrock-runtime`, which does not serve these models.\n\nTwo properties of the route are worth knowing before debugging a failure:\n\n- Its strict schema validator rejects `uniqueItems`, which the scanner strips automatically.\n- A `json_object` request is refused unless a message contains the literal word `json`, which the\n  scanner ensures.\n\nPrompt caching is not applied on this route; `cached_tokens` stays at zero across identical requests,\nso cost planning should not assume it.\n"
 
 
 def _render_configuration_reference() -> str:
@@ -527,7 +735,7 @@ def _render_configuration_reference() -> str:
         "> ```bash",
         "> # Minimal .env for Anthropic",
         '> SKILL_SCANNER_LLM_API_KEY="sk-ant-..."',
-        '> SKILL_SCANNER_LLM_MODEL="anthropic/claude-sonnet-4-20250514"',
+        '> SKILL_SCANNER_LLM_MODEL="claude-sonnet-5-5"',
         "> ```",
         ">",
         "> See [Installation and Configuration](../user-guide/installation-and-configuration.md) for provider-specific setup.",
@@ -554,6 +762,20 @@ def _render_configuration_reference() -> str:
             example_cell = f"`{example}`" if example else ""
             sections.append(f"| `{var}` | {desc}{req} | {example_cell} |")
         sections.append("")
+        if group_title == "AWS / Bedrock":
+            sections.append(_BEDROCK_MANTLE_SECTION)
+
+    sections.extend(
+        [
+            "## OSV Dependency Scanning",
+            "",
+            "The OSV analyzer queries [OSV.dev](https://osv.dev) for known-vulnerable pinned "
+            "dependencies. It is an external service that requires **no API key**, only outbound "
+            "network access to `api.osv.dev`. Enable it with `--use-osv` (or `use_osv` on the API). "
+            "Skip it in air-gapped environments — with no network it fails open and reports nothing.",
+            "",
+        ]
+    )
 
     ungrouped = {v: s for v, s in env_map.items() if v not in grouped_vars}
     if ungrouped:
@@ -619,6 +841,15 @@ def _write_or_check(outputs: dict[Path, str], check: bool) -> int:
 
 
 def main() -> int:
+    if sys.version_info[:2] != REFERENCE_PYTHON:
+        expected = ".".join(str(part) for part in REFERENCE_PYTHON)
+        actual = f"{sys.version_info.major}.{sys.version_info.minor}"
+        print(
+            f"Reference output depends on argparse formatting; use Python {expected} (running {actual}).",
+            file=sys.stderr,
+        )
+        return 2
+
     parser = argparse.ArgumentParser(description="Generate reference docs from source of truth.")
     parser.add_argument("--check", action="store_true", help="Fail if generated outputs differ from committed files")
     args = parser.parse_args()

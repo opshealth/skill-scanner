@@ -24,6 +24,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..llm_reasoning import resolve_llm_reasoning_effort
+from ..llm_token_options import resolve_llm_max_tokens
+from .constants import DEFAULT_LLM_MODEL
+
 
 @dataclass
 class Config:
@@ -35,14 +39,16 @@ class Config:
 
     # LLM Configuration
     llm_provider_api_key: str | None = None
-    llm_model: str = "claude-3-5-sonnet-20241022"
+    llm_model: str = DEFAULT_LLM_MODEL
     llm_base_url: str | None = None
     llm_api_version: str | None = None
-    llm_max_tokens: int = 8192
+    llm_user: str | None = None
+    llm_max_tokens: int | None = None
     llm_temperature: float = 0.0
     llm_rate_limit_delay: float = 2.0
     llm_max_retries: int = 3
     llm_timeout: int = 120
+    llm_reasoning_effort: str | None = None
 
     # AWS Bedrock Configuration
     aws_region_name: str = "us-east-1"
@@ -78,9 +84,26 @@ class Config:
             self.llm_provider_api_key = os.getenv("SKILL_SCANNER_LLM_API_KEY")
 
         # LLM model from environment (only if still at default)
-        if self.llm_model == "claude-3-5-sonnet-20241022":
+        if self.llm_model == DEFAULT_LLM_MODEL:
             if env_model := os.getenv("SKILL_SCANNER_LLM_MODEL"):
                 self.llm_model = env_model
+
+        # Explicit constructor value > scanner-wide environment > default.
+        # Malformed/non-positive environment values are rejected instead of
+        # silently producing provider errors or zero-length responses.
+        self.llm_max_tokens = resolve_llm_max_tokens(self.llm_max_tokens)
+
+        # Explicit constructor value > scanner-wide environment > unset.
+        # Unset deliberately emits no reasoning/thinking request fields.
+        self.llm_reasoning_effort = resolve_llm_reasoning_effort(self.llm_reasoning_effort)
+
+        # Optional raw Chat Completions user field for OpenAI-compatible routes
+        if self.llm_user is not None and not self.llm_user.strip():
+            self.llm_user = None
+        elif self.llm_user is None:
+            if env_user := os.getenv("SKILL_SCANNER_LLM_USER"):
+                if env_user.strip():
+                    self.llm_user = env_user
 
         # AWS configuration from environment (only when not explicitly provided)
         if self.aws_region_name == "us-east-1":
@@ -142,7 +165,7 @@ class Config:
         """
         # Load .env file
         if config_file.exists():
-            with open(config_file) as f:
+            with open(config_file, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:

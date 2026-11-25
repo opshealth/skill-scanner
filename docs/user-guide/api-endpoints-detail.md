@@ -92,11 +92,11 @@ Content-Type: application/json
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `skill_directory` | string | required | Path to skill directory |
-| `policy` | string | null | Scan policy: preset name (`strict`, `balanced`, `permissive`) or path to custom YAML |
+| `policy` | string | null | Scan policy: preset name (`strict`, `balanced`, `permissive`, `low-noise`, `quiet`) or path to custom YAML |
 | `custom_rules` | string | null | Path to custom YARA rules directory |
 | `use_behavioral` | boolean | false | Enable behavioral dataflow analyzer |
 | `use_llm` | boolean | false | Enable LLM semantic analyzer |
-| `llm_provider` | string | `"anthropic"` | LLM provider shortcut (`anthropic` or `openai`) |
+| `llm_provider` | string | `"anthropic"` | LLM provider shortcut (`anthropic`, `openai` or `openai-compatible`) |
 | `llm_consensus_runs` | integer | `1` | Number of LLM passes for majority voting |
 | `use_virustotal` | boolean | false | Enable VirusTotal binary analyzer |
 | `vt_upload_files` | boolean | false | Upload unknown binaries to VirusTotal |
@@ -106,6 +106,11 @@ Content-Type: application/json
 | `enable_meta` | boolean | false | Enable meta-analyzer false-positive filtering |
 
 For Bedrock, Vertex, Azure, Gemini, and other LiteLLM backends, configure `SKILL_SCANNER_LLM_MODEL`/provider environment variables instead of relying on the `llm_provider` shortcut.
+
+Path access is deny-by-default: with `SKILL_SCANNER_ALLOWED_ROOTS` unset, the
+API can access only its process-private `0700` upload root. The operator must
+explicitly allow roots containing `skill_directory`, `skills_directory`, policy
+files, or custom-rule directories before starting the server.
 
 **Response:**
 
@@ -150,6 +155,9 @@ Uploads a ZIP file containing a skill package and scans it. The ZIP file is extr
 API keys (`X-VirusTotal-Key`, `X-AIDefense-Key`) are passed as request headers, same as `/scan`.
 
 **Response:** Same as `/scan`
+
+Malformed skill metadata, such as a `SKILL.md` missing required fields, returns `422` with
+an actionable validation message instead of a generic server error.
 
 ## Batch Scan (Async)
 
@@ -303,5 +311,5 @@ GET /analyzers
 | 400 | Invalid request | Check JSON format and required fields |
 | 404 | Skill not found | Verify directory path exists |
 | 413 | Upload too large | Reduce ZIP size below upload limit |
-| 422 | Validation error | Check field names/types in request body |
+| 422 | Validation error | Check field names/types in request body or required `SKILL.md` metadata fields |
 | 500 | Scan failed | Check logs for detailed error |
